@@ -2,7 +2,23 @@ name: Test
 
 on:
   push:
+    # 与 docker-image.yml 的 paths-ignore 对齐：纯文档/运维/CI 提交不烧 pytest
+    # （docs 提交每次白跑 4-5 分钟 runner）。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'scripts/**'
+      - '.github/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'scripts/**'
+      - '.github/**'
 
 concurrency:
   group: test-${{ github.ref }}

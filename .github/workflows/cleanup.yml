@@ -4,7 +4,8 @@ name: Tencent Docker Cleanup
 #
 # VPS 侧的主自动化是 systemd 定时器 docker-retention.timer（每日 05:30 本地时间），
 # 执行 /usr/local/sbin/docker-retention.sh；本 workflow 是第二道防线：每周把仓库里的
-# scripts/docker_retention.sh 同步到该路径并执行一次，保证保留口径不随本地改动漂移。
+# scripts/docker_retention.sh 同步到该路径、用 scripts/install_retention_units.sh 幂等
+# 重建 systemd 单元与 journald 封顶，再执行一次，保证保留口径不随本地改动漂移。
 #
 # 为什么不再只用 `docker image prune -f`：它只清 dangling，对「带 tag 的旧镜像」无效。
 # 每次发版都会留下 latest + sha-<commit>，旧 sha 标签永久堆积（ai-novel 与 xianyu 同机，
@@ -41,16 +42,17 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Sync retention script and run on tencent
-        # 经 stdin 传脚本：不经 shell 引号解析，顺带把主机定时器使用的副本
-        # /usr/local/sbin/docker-retention.sh 更新为仓库当前版本。
+      - name: Sync retention script and units, run on tencent
+        # 经 stdin 传脚本：不经 shell 引号解析。先同步脚本本体，再跑幂等安装器
+        # （systemd service/timer + journald 封顶，内容不变则无副作用），最后清理。
         run: |
           set -euo pipefail
           tr -d '\r' < scripts/docker_retention.sh | \
-            $SSH_CMD "$SSH_HOST" 'cat > /usr/local/sbin/docker-retention.sh \
-              && chmod 0755 /usr/local/sbin/docker-retention.sh \
-              && KEEP_PREVIOUS_TAGS=1 bash /usr/local/sbin/docker-retention.sh'
+            $SSH_CMD "$SSH_HOST" 'cat > /usr/local/sbin/docker-retention.sh && chmod 0755 /usr/local/sbin/docker-retention.sh'
+          tr -d '\r' < scripts/install_retention_units.sh | $SSH_CMD "$SSH_HOST" 'bash -s'
+          $SSH_CMD "$SSH_HOST" 'KEEP_PREVIOUS_TAGS=1 bash /usr/local/sbin/docker-retention.sh'
 
       - name: Report
+        if: always()
         run: |
           $SSH_CMD "$SSH_HOST" 'docker images | wc -l | xargs echo "image lines:"; df -h / | tail -1; journalctl --disk-usage'

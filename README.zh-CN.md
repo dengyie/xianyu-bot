@@ -1,3 +1,4 @@
+<!-- markdownlint-disable-file MD033 MD045 -->
 <div align="center">
 
 # XianyuBot
@@ -12,6 +13,14 @@
 [![SQLite](https://img.shields.io/badge/SQLite-Encrypted%20Storage-003B57.svg?style=flat-square&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
 [English](./README.md) · [简体中文](./README.zh-CN.md) · [核心功能](#核心功能) · [快速开始](#快速开始) · [配置说明](#配置说明) · [常见问题](#常见问题)
+
+<br>
+
+<p align="center">
+  <b>彻底终结多账号手工盯盘回复疲惫、订单夜间漏发超时与复杂风控滑块掉线困扰。</b><br>
+  严格基于异步 FastAPI、Playwright 与 Chrome DevTools Protocol (CDP) 隧道构建，支持租户数据强隔离。<br>
+  提供多阶关键词与 LLM 智能融合客服、商品卡密全自动履约、定时微扰商品擦亮与物理设备指纹远程滑块协同。
+</p>
 
 </div>
 

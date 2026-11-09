@@ -1,3 +1,4 @@
+<!-- markdownlint-disable-file MD033 MD045 -->
 <div align="center">
 
 # XianyuBot
@@ -12,6 +13,14 @@
 [![SQLite](https://img.shields.io/badge/SQLite-Encrypted%20Storage-003B57.svg?style=flat-square&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
 [English](./README.md) · [简体中文](./README.zh-CN.md) · [Core Features](#core-features) · [Quick Start](#quick-start) · [Configuration](#configuration-guide) · [FAQ](#frequently-asked-questions)
+
+<br>
+
+<p align="center">
+  <b>Terminates manual multi-account customer support fatigue, missed delivery deadlines, and slider verification dropouts on Xianyu.</b><br>
+  Built on asynchronous FastAPI, Playwright, and Chrome DevTools Protocol (CDP) tunneling with isolated multi-tenant data partitioning.<br>
+  Provides multi-tier LLM keyword auto-reply, instant order fulfillment with card/key vaults, automated jittered item polishing, and remote slider assistance.
+</p>
 
 </div>
 

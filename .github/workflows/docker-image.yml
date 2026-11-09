@@ -6,6 +6,12 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
+      # 运维/CI 自身改动不重建应用镜像（2026-11-09）。scripts/ 仅含宿主机运维脚本，
+      # 容器运行时不引用（镜像内副本无入口）；.github/ 只影响流水线。否则一次磁盘
+      # 清理策略的提交会白白触发 3.7GB 跨境重建 + 部署。若 scripts/ 以后被运行时代码
+      # 引用，必须先删除这里的 ignore 规则。
+      - 'scripts/**'
+      - '.github/**'
   workflow_dispatch:
     inputs:
       tag:

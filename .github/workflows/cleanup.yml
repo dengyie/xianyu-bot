@@ -1,7 +1,16 @@
 name: Tencent Docker Cleanup
 
-# 悬空镜像清理（发版后旧 latest 变 dangling）。
-# 生产已在腾讯轻量云，deploy key 以 root 登录，直接清理无需 sudo 密码。
+# 镜像保留策略清理（2026-11-09 起）。
+#
+# VPS 侧的主自动化是 systemd 定时器 docker-retention.timer（每日 05:30 本地时间），
+# 执行 /usr/local/sbin/docker-retention.sh；本 workflow 是第二道防线：每周把仓库里的
+# scripts/docker_retention.sh 同步到该路径并执行一次，保证保留口径不随本地改动漂移。
+#
+# 为什么不再只用 `docker image prune -f`：它只清 dangling，对「带 tag 的旧镜像」无效。
+# 每次发版都会留下 latest + sha-<commit>，旧 sha 标签永久堆积（ai-novel 与 xianyu 同机，
+# 2026-10~11 累积到 15.5G 镜像、11.9G 可回收，40G 盘一度 81%，抵近 10-30 的盘满故障）。
+# 保留规则见脚本头部：容器在用镜像、latest、每仓库最近 1 个非 latest 标签永久保留，
+# 其余旧标签回收，随后 prune dangling / 无引用 build cache，journald 封顶 500M。
 on:
   workflow_dispatch:
   schedule:
@@ -12,10 +21,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prune-dangling-images:
+  retention-cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # 与 deploy-to-tencent 共用串行组：prune 与 pull 并发会撞 containerd ingest
+    timeout-minutes: 15
+    # 与 deploy-to-tencent 共用串行组：rmi/prune 与 pull 并发会撞 containerd ingest
     concurrency:
       group: tencent-docker-serial
       cancel-in-progress: false
@@ -23,6 +32,8 @@ jobs:
       SSH_HOST: ${{ secrets.XIANYU_DEPLOY_HOST }}
       SSH_CMD: ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root
     steps:
+      - uses: actions/checkout@v4
+
       - name: Setup deploy key
         run: |
           mkdir -p ~/.ssh
@@ -30,13 +41,16 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Prune dangling images
+      - name: Sync retention script and run on tencent
+        # 经 stdin 传脚本：不经 shell 引号解析，顺带把主机定时器使用的副本
+        # /usr/local/sbin/docker-retention.sh 更新为仓库当前版本。
         run: |
-          set -o pipefail
-          DOCKER_BIN=$($SSH_CMD "$SSH_HOST" 'command -v docker')
-          echo "remote docker at: $DOCKER_BIN"
-          $SSH_CMD "$SSH_HOST" "$DOCKER_BIN image prune -f"
+          set -euo pipefail
+          tr -d '\r' < scripts/docker_retention.sh | \
+            $SSH_CMD "$SSH_HOST" 'cat > /usr/local/sbin/docker-retention.sh \
+              && chmod 0755 /usr/local/sbin/docker-retention.sh \
+              && KEEP_PREVIOUS_TAGS=1 bash /usr/local/sbin/docker-retention.sh'
 
       - name: Report
         run: |
-          $SSH_CMD "$SSH_HOST" 'docker images -f dangling=true -q | wc -l | xargs echo "dangling images remaining:"; df -h / | tail -1'
+          $SSH_CMD "$SSH_HOST" 'docker images | wc -l | xargs echo "image lines:"; df -h / | tail -1; journalctl --disk-usage'

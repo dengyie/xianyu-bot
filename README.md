@@ -1,238 +1,211 @@
-﻿# 🐷 闲鱼自动化客服机器人 (Xianyu Auto Bot)
+<div align="center">
 
-[![GitHub](https://img.shields.io/badge/GitHub-dengyie%2Fxianyu--auto--bot-blue?logo=github)](https://github.com/dengyie/xianyu-auto-bot)
-[![Python](https://img.shields.io/badge/Python-3.11+-green?logo=python)](https://www.python.org/)
-[![Docker](https://img.shields.io/badge/Docker-支持-blue?logo=docker)](#-docker-一键部署)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Usage](https://img.shields.io/badge/Usage-仅供学习-red.svg)](#-免责声明)
+# XianyuBot
 
-## 📑 项目概述
+**Automated Customer Service, Auto-Fulfillment & Intelligent Operations Assistant for Xianyu**
 
-闲鱼自动化客服系统，基于开源项目二次开发，支持**多用户多账号**管理，具备**智能自动回复**、**自动发货确认**、**商品定时擦亮**、**AI 大模型回复**等企业级功能。
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Playwright](https://img.shields.io/badge/Playwright-1.59+-2EAD33.svg?style=flat-square&logo=playwright&logoColor=white)](https://playwright.dev/)
+[![Docker](https://img.shields.io/badge/Docker-GHCR%20Image-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](https://github.com/dengyie/xianyu-bot/pkgs/container/xianyu-auto-bot)
+[![SQLite](https://img.shields.io/badge/SQLite-Encrypted%20Storage-003B57.svg?style=flat-square&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
-> ⚠️ **重要提示：本项目仅供学习研究使用，严禁商业用途！**
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [Core Features](#core-features) · [Quick Start](#quick-start) · [Configuration](#configuration-guide) · [FAQ](#frequently-asked-questions)
 
-## 🎯 核心功能
+</div>
 
-| 功能模块 | 说明 |
-|---------|------|
-| 🤖 **智能回复** | 关键词匹配 + AI 大模型回复，支持优先级策略 |
-| 👥 **多用户系统** | 独立注册登录，数据完全隔离 |
-| 📱 **多账号管理** | 每个用户可管理多个闲鱼账号，独立启停 |
-| 📦 **自动发货** | 基于商品信息自动匹配发货规则 |
-| ✨ **商品擦亮** | 一键批量擦亮 + 每日定时自动擦亮 |
-| 🔐 **扫码登录** | Playwright 自动化二维码扫码登录 |
-| 🧩 **滑块验证** | 智能轨迹模拟 + 远程人工辅助兜底 |
-| 🐳 **Docker 部署** | 一键 Docker Compose 部署 |
-| 📊 **实时监控** | SSE 实时推送聊天/订单/日志 |
+---
 
-## 🔐 部署前必读
+## Overview
 
-- **镜像只从 GHCR 拉取**：compose 无 `build:`，禁止在 1GB 级 VPS 上本地 build（`docker-deploy.sh build` 会主动拒绝）。
-- **默认凭证只用于本地体验**：正式/联网部署必须通过 `.env` 覆盖 `ADMIN_PASSWORD`、`JWT_SECRET_KEY`、`SECRET_ENCRYPTION_KEY`（换 key 会导致旧 Cookie 密文不可解，迁移前想清楚）。
-- **端口默认仅绑定回环**（`127.0.0.1:9000`）：公网访问请走 HTTPS 反向代理并限制来源；**不要**把 `5900`（VNC）/`6080`（noVNC）直接暴露公网。
-- **`data/`、`logs/`、`backups/`、`global_config.yml` 与 `.env` 含敏感数据**：不进 Git、不贴 Issue/PR、公开日志截图前先脱敏（Cookie/Token/账号密码/数据库凭据）。
-- 完整密钥注入说明见 [`.env.example`](.env.example)，漏洞反馈见 [SECURITY.md](SECURITY.md)。
+**XianyuBot** is an asynchronous, multi-tenant customer service automation, auto-delivery, and account operations engine tailored for Xianyu (Idle Fish). Built on FastAPI, asyncio, and Playwright, it coordinates intelligent keyword/LLM message processing, SKU-bound digital asset delivery, periodic item polishing, physical device fingerprint emulation via Chrome DevTools Protocol (CDP), and remote human verification fallback.
 
-## 🛠️ 技术栈
+> **Notice**: This project is intended strictly for academic research and educational exploration. Commercial use and activities violating platform terms of service are strictly prohibited.
 
-| 层级 | 技术 |
-|------|------|
-| 后端框架 | FastAPI + Uvicorn (Python 3.11+) |
-| 异步引擎 | asyncio + aiohttp + websockets |
-| 数据库 | SQLite 3 + Fernet 加密 |
-| 前端 | Bootstrap 5 + Vanilla JS + SSE |
-| 浏览器自动化 | Playwright 1.59 + DrissionPage 4.0 |
-| AI 引擎 | OpenAI / Gemini / Anthropic / Azure / Ollama / 通义 |
-| 容器化 | Docker + Docker Compose + Nginx |
-| 日志 | Loguru (按日轮转, 保留7天) |
+---
 
-## 🚀 快速开始
+## Core Features
 
-### 环境要求
+| Module | Description |
+|---|---|
+| **Intelligent Auto-Reply** | Exact and fuzzy keyword matching combined with contextual LLM inference across configurable priority tiers |
+| **Multi-Tenant System** | Isolated user registration, authentication, and role-based data partitioning |
+| **Multi-Account Operations** | Manages multiple Xianyu accounts per tenant with independent session lifecycles and background health checks |
+| **Automated Delivery** | Listens for completed transactions, mapping orders to automated delivery templates and card/key fulfillment |
+| **Periodic Item Polishing** | Bulk on-demand polishing and jittered cron schedules to keep item listings fresh |
+| **Automated QR Login** | Headless and headed QR session acquisition powered by Playwright |
+| **Risk Control & Slider Solving** | Realistic mouse trajectories, physical host CDP tunneling, and remote human interactive fallback |
+| **Containerized Delivery** | Production-ready Docker Compose deployment backed by automated GitHub Actions CI/CD pipelines |
+| **Real-Time Telemetry** | Server-Sent Events (SSE) streaming live order events, incoming inquiries, and audit events |
 
-- Python 3.11+
-- Chrome/Chromium 浏览器
-- (可选) Docker & Docker Compose
+---
 
-### 本地部署
+## Pre-Flight Deployment Requirements
+
+- **Pull Pre-Built Images from GHCR**: `docker-compose.yml` points directly to GitHub Packages. Do not run `docker compose build` on low-memory VPS instances (1 GB RAM environments will trigger OOM panics).
+- **Override Default Credentials**: For Internet-facing setups, you must override `ADMIN_PASSWORD`, `JWT_SECRET_KEY`, and `SECRET_ENCRYPTION_KEY` in `.env`. Changing encryption keys invalidates existing stored session cookies, so persist them before launching.
+- **Bind Loopback Only**: The application defaults to `127.0.0.1:9000`. Expose Web interfaces through a secure reverse proxy (Caddy / Nginx) with HTTPS. Never expose ports `5900` (VNC) or `6080` (noVNC) directly to the public Internet.
+- **Sensitive Path Isolation**: Directories `data/`, `logs/`, `backups/`, and configuration files `.env` and `global_config.yml` contain encrypted cookies, tokens, and credentials. Ensure they remain excluded from version control and logs are sanitized before reporting issues.
+- Refer to [`.env.example`](.env.example) for variable definitions.
+
+---
+
+## Tech Stack
+
+| Layer | Component | Notes |
+|---|---|---|
+| Web Service | FastAPI + Uvicorn | Python 3.11+ high-throughput async framework |
+| Concurrency | asyncio + aiohttp + websockets | Non-blocking socket polling and persistent gateway sessions |
+| Storage | SQLite 3 + Fernet (Cryptography) | Embedded zero-dependency database with symmetric secret encryption |
+| Interface | Bootstrap 5 + Vanilla JS + SSE | Single-page application console with live event streams |
+| Browser Automation | Playwright 1.59 + Patchright | Undetected CDP and automation driver |
+| Model Integrations | OpenAI / Claude / Gemini / Ollama / Qwen | OpenAI-compatible streaming dialogue generation |
+| Infrastructure | Docker + Docker Compose | Containerized cross-platform deployment |
+| Logging | Loguru | Structured, rotating log sinks with retention policies |
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11 or later
+- Chrome / Chromium browser
+- Docker & Docker Compose (optional, recommended for production)
+
+### Local Development Setup
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/dengyie/xianyu-auto-bot.git
-cd xianyu-auto-bot
+# 1. Clone repository
+git clone https://github.com/dengyie/xianyu-bot.git
+cd xianyu-bot
 
-# 2. 创建虚拟环境
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# Linux/macOS
+# 2. Initialize and activate virtual environment
+python3 -m venv venv
+# Linux / macOS
 source venv/bin/activate
+# Windows PowerShell
+venv\Scripts\Activate.ps1
 
-# 3. 安装锁定依赖
+# 3. Install hash-pinned dependencies
 pip install --require-hashes -r requirements.lock
 pip install --no-deps "slidex @ git+https://github.com/dengyie/slidex.git@0d41893"
 
-# 4. 安装 Playwright 浏览器
+# 4. Install Playwright browser binaries
 playwright install chromium
 
-# 5. 启动服务
+# 5. Start service
 python Start.py
-
-# 6. 打开管理界面
-# http://localhost:8090
-# 管理员用户名为 admin；密码优先读取 ADMIN_PASSWORD，否则首次启动时随机生成并输出到启动日志
 ```
 
-### Docker 一键部署（镜像由 GitHub Actions 构建）
+Access the dashboard at `http://localhost:8090`. The default administrator username is `admin`. The initial password is read from `ADMIN_PASSWORD` or generated randomly in console output during first boot.
 
-生产镜像只发布到 GHCR，**不要**在本机/VPS 上 `docker compose build`（尤其 1GB 机器会卡死）。
+### Docker Compose Deployment
+
+Production images are packaged and published to GitHub Packages (GHCR):
 
 ```bash
-# 1) 代码 push 到 main 后，等待 Actions「Build and Push Docker Image」成功
-#    产物：ghcr.io/dengyie/xianyu-auto-bot:latest
-
-# 2)（推荐）固化 GHCR 登录，避免包变 private 后 pull 失败
-#    PAT 需要 read:packages；token 只放本机，勿提交仓库
-export GHCR_TOKEN='ghp_...'   # 或写入 ~/.config/xianyu/ghcr_token（chmod 600）
+# 1. Authorize GHCR access (recommended for consistent rate limits)
+export GHCR_TOKEN='ghp_...'
 ./docker-deploy.sh login-ghcr
 
-# 3) 应用密钥：复制 .env.example → .env 并填写（compose 自动替换 ${VAR}）
+# 2. Configure environment parameters
 cp .env.example .env
 chmod 600 .env
-# 编辑 ADMIN_PASSWORD / SECRET_ENCRYPTION_KEY / JWT_SECRET_KEY / 各 API_KEY
+# Set ADMIN_PASSWORD, SECRET_ENCRYPTION_KEY, JWT_SECRET_KEY in .env
 
-# 4) 拉取并启动（推荐脚本）
-./docker-deploy.sh update   # 备份 + pull + recreate --no-build
-# 或分步：
-./docker-deploy.sh pull
-./docker-deploy.sh start
+# 3. Pull latest image and launch
+./docker-deploy.sh update
 
-# 5) 等价手写
+# Or via standard Docker Compose command
 docker pull ghcr.io/dengyie/xianyu-auto-bot:latest
 docker compose up -d --no-build
 ```
 
-- 默认端口绑定 **`127.0.0.1:9000→8090`**（loopback）；`docker-compose-cn.yml` 为 `127.0.0.1:8000`。
-- 可选环境变量 `XIANYU_IMAGE` 覆盖镜像名。
-- **密钥注入路径**：项目目录 `.env`（Compose 变量替换）→ `docker-compose.yml` 的 `environment:` → 容器进程；**不是** `env_file:` 指令。`.env` 已 gitignore。
+---
 
-## 📁 项目结构
+## Project Structure
 
-```
-xianyu-auto-bot/
-├── Start.py                    # 主入口
-├── XianyuAutoAsync.py          # 核心引擎 (WebSocket/消息/回复)
-├── reply_server.py             # FastAPI Web 服务
-├── cookie_manager.py           # 多账号调度
-├── db_manager/                 # 数据库管理分层包 (SQLite + 加密)
-├── db_manager.py               # 兼容旧导入的待移除实现（迁移完成后删除）
-├── ai_reply_engine.py          # AI 回复引擎
-├── chat_event_hub.py           # 聊天事件中心
-├── order_event_hub.py          # 订单事件中心
-├── order_status_handler.py     # 订单状态机
-├── config.py                   # 配置管理
-├── global_config.yml           # 全局配置
-├── utils/                      # 工具集
-│   ├── qr_login.py             #   扫码登录
-│   ├── xianyu_slider_stealth.py#   滑块验证
-│   ├── image_uploader.py       #   图片上传
-│   └── ...
-├── static/                     # 前端 (Bootstrap 5 SPA)
-├── tests/                      # 测试
-├── nginx/                      # Nginx 配置
-├── Dockerfile                  # Docker 镜像
-└── docker-compose.yml          # Docker Compose
+```text
+xianyu-bot/
+├── Start.py                    # Application entry point
+├── XianyuAutoAsync.py          # Core async message engine and connection coordinator
+├── reply_server.py             # FastAPI REST endpoints and static file serving
+├── cookie_manager.py           # Multi-account credential manager and health monitor
+├── db_manager/                 # Layered SQLite schema and data access objects
+├── ai_reply_engine.py          # LLM inference pipeline and prompt orchestrator
+├── chat_event_hub.py           # Message bus for real-time customer conversations
+├── order_event_hub.py          # Transaction event bus and fulfillment triggers
+├── order_status_handler.py     # Finite state machine for order lifecycle management
+├── config.py                   # Configuration loader and environment bindings
+├── global_config.yml           # Default operational parameters
+├── utils/                      # Utilities (stealth sliders, QR helpers, telemetry)
+│   ├── qr_login.py             # QR session lifecycle handler
+│   ├── xianyu_slider_stealth.py# Humanized slider solver and CDP hooks
+│   └── image_uploader.py       # Image asset uploader
+├── static/                     # Web dashboard frontend assets
+├── tests/                      # Unit and integration test suites
+├── Dockerfile                  # Production container definition
+└── docker-compose.yml          # Docker Compose production manifest
 ```
 
-## 🔧 配置说明
+---
 
-编辑 `global_config.yml` 可调整以下配置：
+## Configuration Guide
 
-- **WEBSOCKET_URL**: 闲鱼 WebSocket 地址
-- **AUTO_REPLY**: 自动回复开关和默认消息
-- **RISK_CONTROL**: 风控参数 (夜间模式/退避策略等)
-- **SLIDER_VERIFICATION**: 滑块并发数和超时
-- **TOKEN_REFRESH_INTERVAL**: Token 刷新周期
+### Global Settings (`global_config.yml`)
 
-### 生产环境变量
+- `WEBSOCKET_URL`: Xianyu gateway WebSocket endpoint.
+- `AUTO_REPLY`: Global auto-reply toggles, rules, and default templates.
+- `RISK_CONTROL`: Anti-ban intervals, quiet night mode, and backoff parameters.
+- `SLIDER_VERIFICATION`: Concurrency bounds and maximum solver timeouts.
+- `TOKEN_REFRESH_INTERVAL`: Frequency of proactive session token updates.
 
-以下配置不应使用示例值或提交到仓库：
+### Production Environment Variables
 
-| 变量 | 必需性 | 用途 |
-|------|--------|------|
-| `ADMIN_PASSWORD` | 建议显式设置 | 首次初始化管理员密码；未设置时生成随机密码并仅写入启动日志 |
-| `XIANYU_REPLY_API_KEY` | 使用自动回复回调时必需 | 保护 `/xianyu/reply`，内部调用通过 `X-Internal-API-Key` 发送 |
-| `CAPTCHA_CONTROL_API_KEY` | 使用远程验证时必需 | 保护 `/api/captcha` 管理入口；人工面板也可用会话级 `?token=` |
-| `CAPTCHA_PUBLIC_BASE_URL` | 建议显式设置 | 人工面板 control_url 的对外基址（如 `https://面板域名`）；不设则回落 `localhost:{API_PORT}`，仅本机可点开 |
-| `SEND_MESSAGE_API_KEY` | 使用消息发送 API 时必需 | 保护 `/send-message` |
-| `SECRET_ENCRYPTION_KEY` | 生产建议固定 | 加密 Cookie、密码和代理凭据；更换会导致旧数据不可解密 |
+| Variable | Requirement | Purpose |
+|---|---|---|
+| `ADMIN_PASSWORD` | Recommended | Initial administrative password |
+| `XIANYU_REPLY_API_KEY` | Required for callbacks | Secures `/xianyu/reply` using `X-Internal-API-Key` |
+| `CAPTCHA_CONTROL_API_KEY` | Required for captcha API | Protects `/api/captcha` endpoints |
+| `CAPTCHA_PUBLIC_BASE_URL` | Recommended | Public URL for human slider fallback (e.g., `https://captcha.example.com`) |
+| `SEND_MESSAGE_API_KEY` | Required for messaging API | Secures external proactive messaging via `/send-message` |
+| `SECRET_ENCRYPTION_KEY` | Required in production | Symmetric key used to encrypt stored cookies and credentials |
 
-可用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成独立密钥。不同用途不得复用同一密钥。
+---
 
-### CDP 模式（真实设备指纹拖滑块，可选兜底）
+## Risk Control & Captcha Handling
 
-账号被滑块风控针对时，容器内浏览器怎么拖都会被拒（设备指纹不匹配）；此时 bot 可连接**用户 PC 上的真实 Chrome** 拖滑块（真实设备指纹 + 家宽直连，人也可以随时接管拖动）。开关为环境变量：
+### Physical Host CDP Mode
 
-| 变量 | 用途 |
-|------|------|
-| `XY_SLIDER_CDP_ENDPOINT` | 非空启用；值固定 `http://172.19.0.1:9222`（VPS docker 网桥网关地址，容器内 `localhost` 指向容器自身，不可用） |
+When accounts face elevated device-level verification challenges, the bot can delegate slider handling to Google Chrome running on a physical host workstation:
 
-**用户 PC 侧一次性准备：**
+1. Launch Chrome with remote debugging enabled:
+   ```bash
+   chrome.exe --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\xianyu-cdp" --no-first-run
+   ```
+2. Run the reverse tunnel daemon (`scripts/cdp_tunnel.ps1`) to bridge the workstation and container.
+3. XianyuBot detects the challenge and drives the real device fingerprint via CDP, harvesting valid `x5sec` tokens automatically or allowing manual intervention.
 
-1. Chrome 以独立 profile 带调试端口启动（Chrome 136+ 默认 profile 禁 CDP；无需登录任何账号）：
-   `chrome.exe --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\xianyu-cdp" --no-first-run --no-default-browser-check`
-2. 反向隧道守护（断线 5 秒自动重连，独立于任何会话/工具运行）：
-   `powershell -ExecutionPolicy Bypass -File scripts\cdp_tunnel.ps1`
-   开机自启见脚本头部注释（`shell:startup` 快捷方式）。
-3. VPS sshd 需 `GatewayPorts clientspecified`——隧道只绑定 docker 网桥内网地址，**严禁 `0.0.0.0` 公网暴露无鉴权 CDP**。
+### Remote Human Verification Panel
 
-**行为要点**：bot 连上后注入账号会话 cookie 并打开处罚页，先自动拖（拖到终点变绿后握住停顿再松键）；拖不过会进入约 5 分钟人工等待期，期间你随时手动拖过都会被自动收割；滑块成功后若 aiohttp 重试 token 仍被惩罚，token 请求自动改从浏览器内发出。CDP 端点不可达时快速失败并提示运行隧道脚本。
+- When automatic solving fails or risk scores exceed thresholds, the server provisions a temporary interactive link: `/api/captcha/control/{session_id}?token=...`.
+- Administrators can open the link in any mobile or desktop browser to slide the verification bar manually without exposing master server keys.
+- Completion requires cryptographic validation of the resulting `x5sec` token before the account session is resumed.
 
-### Cookie 登录与滑块（推荐大众路径）
+---
 
-开源默认路径对齐 GuDong 思路：**Cookie 登录为主**，自动滑块（严格要求拿到 `x5sec`）失败后再人工收口，而不是默认暴露 Chrome/VNC。
+## Frequently Asked Questions
 
-1. **导入完整 Cookie**（含 `unb` / `cookie2` 等）到管理后台。
-2. **自动滑块链路**：可选远端 HTTP solver → 本地 strict 滑块 → Drission 兜底；**视觉通过但无 `x5sec` 仍算失败**。
-3. **人工面板**：自动仍失败时，服务会创建 `/api/captcha/control/{session_id}?token=...` 并通知；浏览器打开该 URL 即可滑动（无需把全局 `CAPTCHA_CONTROL_API_KEY` 塞进 header）。
-4. 人工完成后同样强制校验 `x5sec`，通过才合并 Cookie 并恢复账号。
+**Q: WebSocket disconnects frequently or fails to establish?**  
+Verify server outbound firewall settings, proxy stability, and ensure the account's mobile session has not been superseded.
 
-相关环境变量（详见 `.env.example`）：
+**Q: Docker container exits with `exec /app/entrypoint.sh: no such file`?**  
+This typically indicates Windows CRLF line endings in shell scripts or an incomplete repository clone. Use the official pre-built image: `docker pull ghcr.io/dengyie/xianyu-auto-bot:latest`.
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `API_PORT` | `8090` | 面板 URL 端口 |
-| `SERVER_HOST` / `PUBLIC_IP` | 自动探测 | 面板可达主机 |
-| `CAPTCHA_PUBLIC_BASE_URL` | 空 | 反代完整前缀时优先使用 |
-| `CAPTCHA_CONTROL_API_KEY` | 空 | 管理接口必需；会话 token 可打开单会话面板 |
-| `XY_SLIDER_HUMAN_FALLBACK` | `true` | 设为 `0/false` 可关闭人工兜底（orchestrator 层，token 刷新链路） |
-| `SLIDEX_REMOTE_TIMEOUT` | `180` | 人工等待超时（秒） |
-| `XY_ENABLE_AUTO_SLIDER` | `true` | 设为 `0/false/no/off` 时滑块改人工接管（XianyuSliderStealth 类内；手动导入/密码恢复等直连链路生效，强制有头） |
-| `XY_MANUAL_SLIDER_TIMEOUT` | `180` | 人工滑块等待超时（秒，下限 30） |
-| `XY_SLIDER_RISK_WINDOW` | `1800` | token 刷新滑块风控门控回看窗口（秒，下限 300） |
-| `XY_SLIDER_RISK_FAILURE_THRESHOLD` | `6` | 窗口内连续失败达到该值且无成功记录时延迟验证（下限 3） |
-| `XY_SLIDER_HEADLESS` | `0`（compose 默认） | 滑块/人工面板浏览器无头开关；`1` 无头，`0` 有头（容器内依赖 `USE_XVFB=true`） |
-| `XY_SLIDER_AUTOMATION_BACKEND` | `patchright`（compose 默认） | 浏览器自动化后端：`patchright`（反 CDP 检测）/ `playwright`（回退） |
-| `XY_OUTBOUND_IP_PROBE_URL` | `https://api.ipify.org?format=json` | 出口 IP 一致性探测地址；置空可禁用 |
-
-部署仍走 **Actions → GHCR → VPS `./docker-deploy.sh update`**，不要在 VPS 上 `compose build`。不要默认公网暴露 Chrome/noVNC。
-
-### 健康检查与部署限制
-
-- `GET /health/live` 仅用于确认 Web 进程存活，适合作为容器 liveness probe。
-- `GET /health` 检查数据库、CookieManager 和进程资源，适合作为 readiness probe。
-- 数据库恢复期间，除 `/health/live` 外的请求会返回 `503`。
-- 当前会话、维护锁和账号任务均为进程内状态，只支持单 Uvicorn worker 和单应用副本。启用多 worker 或多副本会导致状态分裂；必须先迁移到外部会话存储、分布式锁和任务协调器。
-
-### 数据库恢复
-
-管理员上传 `.db` 后，服务会先在临时文件上执行 SQLite 完整性及必需表检查，再进入维护态。恢复过程暂停账号任务、备份在线库、原子替换数据库、刷新 CookieManager，并撤销所有登录和下载令牌；失败时会恢复原数据库。恢复成功后需要重新登录。
-
-### 依赖更新
-
-`requirements.txt` 保存人工维护的兼容范围，`requirements.lock` 是 Python 3.11/Linux 的发布输入。修改依赖后执行：
-
+**Q: How do I update dependencies?**  
+Update requirements using `uv` to generate cryptographic hash verification:
 ```bash
 uv pip compile requirements.txt \
   --python-version 3.11 \
@@ -242,33 +215,19 @@ uv pip compile requirements.txt \
   --output-file requirements.lock
 ```
 
-Playwright 固定为 `1.59.0`。`slidex` 因为是 VCS 依赖，不能参与 pip 的 `--require-hashes`，因此从主锁文件中排除，并以 `--no-deps` 单独安装固定提交 `0ac617c`（0.6.31）；其余依赖仍全部强制哈希校验。
+---
 
-## ❓ 常见问题
+## Acknowledgments
 
-**Q: WebSocket 连接失败？**
-检查网络和防火墙设置，确认闲鱼账号 Cookie 有效。
+This project builds upon the shared knowledge of the open-source community:
 
-**Q: Docker 启动报错 `exec /app/entrypoint.sh: no such file`？**
-```bash
-docker compose down
-# 重新拉取 GHCR 镜像（不要本地 build）
-docker pull ghcr.io/dengyie/xianyu-auto-bot:latest
-docker compose up -d --no-build --force-recreate
-```
-若镜像本身损坏，在 GitHub 对 `docker-image.yml` 跑 `workflow_dispatch` 重建后再 pull。
+- [myfish](https://github.com/Kaguya233qwq/myfish) — QR session login architecture
+- [XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent) — Automation state machine reference
 
-**Q: Windows 系统部署问题？**
-直接使用批处理脚本: `docker-deploy.bat`
+---
 
-## 🎖️ 致谢
+## License & Disclaimer
 
-本项目基于以下开源项目：
+Released under the [MIT License](LICENSE).
 
-- 原始项目框架 — 感谢开源社区贡献
-- [myfish](https://github.com/Kaguya233qwq/myfish) - 扫码登录思路
-- [XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent) - 自动化处理参考
-
-## ⚖️ 免责声明
-
-本项目按"现状"提供，仅供学习研究使用。严禁用于商业用途或任何违法违规场景。因使用本项目产生的风险、损失或责任，由使用者自行承担。
+**Disclaimer**: This project is provided "as is" without warranty of any kind. It is intended solely for research and personal automation tasks. Users are solely responsible for ensuring compliance with applicable laws and platform regulations.

@@ -28,6 +28,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
+# 镜像名单事实源（2026-11-10 根修）：仓库从 xianyu-auto-bot 改名 xianyu-bot 后，
+# metadata-action 的 `github.event.repository.name` 变成 xianyu-bot，而部署 helper
+# 与宿主机 compose 仍指向 xianyu-auto-bot —— 构建推新包、部署拉旧包，deploy job
+# 每次都"绿"但线上永远停在 10-31 的旧镜像（slidex 0.6.42）。镜像名统一由这里
+# 一处决定，构建（metadata images）与部署（helper REPO）都引用它，杜绝再次分叉。
+env:
+  REPO_IMAGE: ghcr.io/dengyie/xianyu-auto-bot
+
 jobs:
   # 部署门禁：此前 push main 时 Test 与本 workflow 并行、互不依赖，
   # 测试失败照样构建部署；现把 pytest 纳入 needs 链。
@@ -117,14 +125,16 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+          # 镜像名统一引用工作流级 REPO_IMAGE（不要再用 repository.name，
+          # 仓库改名会让它和部署侧分叉——见顶部 env 注释）
+          images: ${{ env.REPO_IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=sha,enable=${{ github.event_name == 'push' }},format=short
+            type=sha,enable=${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }},format=short
 
       - name: Build and push multi-arch images
         uses: docker/build-push-action@v5
@@ -150,8 +160,10 @@ jobs:
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:buildcache,mode=max
 
   deploy-to-tencent:
-    # 镜像构建成功后自动部署到腾讯轻量云生产（仅 push to main 触发）
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # 镜像构建成功后自动部署到腾讯轻量云生产（push to main 自动）；
+    # workflow_dispatch 提供手动重部署入口（.github/** 在 paths-ignore 里，
+    # 纯 CI 修复不会自动触发，手动 dispatch 是刻意留的逃生口）
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: build-and-push
     runs-on: ubuntu-latest
     # 跨境 pull 实测单次可达 ~25 分钟；30 分钟上限曾连续 3 轮被取消（1046c71）。
@@ -180,7 +192,7 @@ jobs:
         # 镜像不可达时回退直连 compose pull。仍用 setsid 解耦 SSH:重跑 job 复用仍在跑的
         # pull,不重复抢 containerd ingest 锁。
         run: |
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" "SHORT_SHA=${{ github.sha }} bash -s" << 'DEPLOY_SCRIPT'
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" "SHORT_SHA=${{ github.sha }} REPO_IMAGE=${{ env.REPO_IMAGE }} bash -s" << 'DEPLOY_SCRIPT'
           set -euo pipefail
           LOG=/tmp/xianyu_pull.log
           EXITF=/tmp/xianyu_pull.exit
@@ -190,7 +202,9 @@ jobs:
           #!/usr/bin/env bash
           SHORT="$1"
           EXPECT_REV="$2"
-          REPO=dengyie/xianyu-auto-bot
+          # 镜像名单源：与构建 metadata `images` 同源（工作流级 env.REPO_IMAGE），
+          # 千万不要写死或改用 repository.name —— 2026-11-10 分叉事故的根因。
+          REPO="${REPO_IMAGE#ghcr.io/}"
           MIRROR=ghcr.nju.edu.cn
           LOG=/tmp/xianyu_pull.log
           EXITF=/tmp/xianyu_pull.exit
@@ -250,6 +264,22 @@ jobs:
           done
           echo "::error::pull did not finish within ~50 minutes"
           exit 1
+
+      - name: Verify deployed image revision
+        # 防"绿但旧"（2026-11-10 事故）：pull 成功 ≠ 拉到了本次提交——镜像名分叉
+        # 或镜像源滞后时，compose pull 会"成功"拉到 stale latest，健康检查照样绿。
+        # 强制校验本地 latest 的 revision 标签 == 本次 commit sha，不符直接判红。
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
+            "REPO_IMAGE=${{ env.REPO_IMAGE }} EXPECT=${{ github.sha }} bash -s" <<'GATE'
+          set -euo pipefail
+          GOT=$(sudo docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REPO_IMAGE:latest")
+          echo "deployed revision=$GOT expected=$EXPECT"
+          if [ "$GOT" != "$EXPECT" ]; then
+            echo "::error::stale image: latest revision $GOT != $EXPECT (镜像名/镜像源分叉)"
+            exit 1
+          fi
+          GATE
 
       - name: Recreate container on tencent
         run: |

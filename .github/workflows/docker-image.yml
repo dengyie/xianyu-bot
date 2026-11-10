@@ -151,13 +151,16 @@ jobs:
           # 一次拉完（overlay2 不回续传，失败即从 0 重来）。改为 GHCR 持久缓存 +
           # 以 VPS 已部署镜像为种子，令重建复用同一批层，VPS 只需下变化的应用层。
           # `sha-de8805d` 是种子：指向线上当前镜像，保证本次重建与该镜像层一致。
+          # 缓存 ref 同样只用 REPO_IMAGE（2026-11-11 补齐）：改名后这里若仍取
+          # repository.name，会指向 xianyu-bot 这个空包——每次构建缓存全未命中，
+          # apt+Playwright 层整层重下，正是本段注释要防的失效场景。
           cache-from: |
             type=gha
-            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:buildcache
-            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:sha-de8805d
+            type=registry,ref=${{ env.REPO_IMAGE }}:buildcache
+            type=registry,ref=${{ env.REPO_IMAGE }}:sha-de8805d
           cache-to: |
             type=gha,mode=max
-            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:buildcache,mode=max
+            type=registry,ref=${{ env.REPO_IMAGE }}:buildcache,mode=max
 
   deploy-to-tencent:
     # 镜像构建成功后自动部署到腾讯轻量云生产（push to main 自动）；

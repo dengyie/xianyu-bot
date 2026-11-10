@@ -113,14 +113,13 @@ ENV NODE_PATH=/usr/lib/node_modules
 COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple&& \
     pip install --no-cache-dir --require-hashes -r requirements.lock -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install --no-cache-dir --no-deps "slidex @ git+https://github.com/dengyie/slidex.git@231c196beabb3c0e074c6fc3a7feab1085de08cf"
+    pip install --no-cache-dir --no-deps "slidex @ git+https://github.com/dengyie/slidex.git@53a5030172ca4ed0dcd72b5884b1397da6d239d0"
 
-# 复制项目文件
-COPY . .
-
-# 安装Playwright浏览器（必须在复制项目文件之后）
+# 安装Playwright浏览器（只依赖上面装好的 playwright/patchright 包与系统库，不读项目文件）
 # patchright 的 chromium revision（1243）与 playwright 1.59（1223）不同，需各自安装；
 # 两者共用 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright。
+# 排在 COPY . . 之前：原先在之后，任何业务代码提交都会让这一层失效，
+# 每次部署重下两套 Chromium + 重装 apt 依赖（~900MB），拉镜像 40 分钟量级。
 RUN playwright install chromium && \
     playwright install-deps chromium && \
     patchright install chromium && \
@@ -129,6 +128,9 @@ RUN playwright install chromium && \
     ln -sf "$CHROME_BIN" /usr/bin/chromium && \
     ln -sf "$CHROME_BIN" /usr/bin/chromium-browser && \
     ln -sf "$CHROME_BIN" /usr/bin/google-chrome
+
+# 复制项目文件
+COPY . .
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images /app/trajectory_history && \

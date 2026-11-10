@@ -26,7 +26,11 @@
 
 set -uo pipefail
 
-REPO_PREFIXES="${REPO_PREFIXES:-ghcr.io/dengyie/ ghcr.nju.edu.cn/dengyie/}"
+# 按命名空间匹配，而非写死镜 registry 前缀：镜像源会随部署脚本变动
+# （ghcr.io / ghcr.nju.edu.cn / ghcr.dockerproxy.net 均已实际出现过），
+# 前缀白名单会漏掉新源、让旧源副本越过保留策略永久堆积（实测 3.7GB 一次）。
+# 匹配规则：仓库路径含 /<REPO_NAMESPACE>/ 即纳入管理。
+REPO_NAMESPACE="${REPO_NAMESPACE:-dengyie}"
 KEEP_PREVIOUS_TAGS="${KEEP_PREVIOUS_TAGS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 JOURNAL_MAX="${JOURNAL_MAX:-500M}"
@@ -83,18 +87,16 @@ IN_SCOPE=0
 while IFS='|' read -r repo tag id created; do
     [ -z "$repo" ] && continue
     [ "$tag" = "<none>" ] && continue
-    for p in $REPO_PREFIXES; do
-        case "$repo" in
-            "$p"*)
-                printf '%s|%s|%s|%s\n' "$repo" "$tag" "$id" "$created" >> "$TMP"
-                IN_SCOPE=$((IN_SCOPE + 1))
-                break
-                ;;
-        esac
-    done
+    # 同时覆盖带 registry 的（ghcr.io/dengyie/...）和裸命名空间的（dengyie/...）
+    case "$repo" in
+        "$REPO_NAMESPACE"/*|*/"$REPO_NAMESPACE"/*)
+            printf '%s|%s|%s|%s\n' "$repo" "$tag" "$id" "$created" >> "$TMP"
+            IN_SCOPE=$((IN_SCOPE + 1))
+            ;;
+    esac
 done <<< "$rows"
 
-log "扫描到 ${IN_SCOPE} 个受管标签（前缀: $REPO_PREFIXES）"
+log "扫描到 ${IN_SCOPE} 个受管标签（命名空间: $REPO_NAMESPACE）"
 
 REMOVE=()
 repos=$(awk -F'|' 'NF{print $1}' "$TMP" | sort -u)

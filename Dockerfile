@@ -113,7 +113,7 @@ ENV NODE_PATH=/usr/lib/node_modules
 COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple&& \
     pip install --no-cache-dir --require-hashes -r requirements.lock -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install --no-cache-dir --no-deps "slidex @ git+https://github.com/dengyie/slidex.git@192c69f787daefdff2c2f766b8f4e88738ef2909"
+    pip install --no-cache-dir --no-deps "slidex @ git+https://github.com/dengyie/slidex.git@7461a2634df5dc444d6f767eb80d59a01765395e"
 
 # 安装Playwright浏览器（只依赖上面装好的 playwright/patchright 包与系统库，不读项目文件）
 # patchright 的 chromium revision（1243）与 playwright 1.59（1223）不同，需各自安装；

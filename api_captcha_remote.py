@@ -364,15 +364,24 @@ async def check_completion(request: SessionCheckRequest, _: None = Depends(requi
 async def submit_trajectory(request: TrajectorySubmitRequest, _: None = Depends(require_captcha_control_key)):
     try:
         from slidex._trajectory_pool import SliderTrajectoryPool
+        from slidex._slide_geometry import recorded_geometry_verdict
         trajectory_pool = SliderTrajectoryPool()
-        if not request.points or len(request.points) < 3:
+        if not request.points or len(request.points) < 2:
             raise HTTPException(status_code=400, detail="too few points")
-        trajectory_pool.save_trajectory(request.points, request.cookie_id, request.distance, True, request.verify_url or "")
-        logger.success(f"trajectory saved: cookie={request.cookie_id}")
-        return {"success": True, "message": "saved", "cookie_id": request.cookie_id}
+        saved = trajectory_pool.save_trajectory(request.points, request.cookie_id, request.distance, True, request.verify_url or "")
+        if not saved:
+            # 几何闸门拒收：必须回 400，不能回 success —— 上报方据此重录，
+            # 而不是以为池里已有一条好数据。
+            reason = recorded_geometry_verdict(request.points, request.distance) or "unknown"
+            logger.warning(f"trajectory rejected by geometry check: cookie={request.cookie_id} reason={reason}")
+            raise HTTPException(status_code=400, detail=f"rejected by geometry check: {reason}")
+        logger.success(f"trajectory saved: cookie={request.cookie_id} ({saved})")
+        return {"success": True, "message": "saved", "cookie_id": request.cookie_id, "file": saved}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"trajectory save failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="trajectory save failed")
 
 @router.delete("/session/{session_id}")
 async def close_session(session_id: str, _: None = Depends(require_captcha_control_key)):

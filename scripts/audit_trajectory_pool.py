@@ -97,7 +97,9 @@ section("4. offline replay smoothness")
 for cid in cookies:
     target = 400.0
     pool = SliderTrajectoryPool(base_dir=BASE)
-    rec = pool.load_best_trajectory(cid, target, distance_tolerance=0.25)
+    # peek=True：审计是只读探针，不得推进 LRU 时钟（slidex>=0.11.6 的 peek 语义，
+    # 0.11.5 及更早的池会把审计跑成一次 last_used 写盘）。
+    rec = pool.load_best_trajectory(cid, target, distance_tolerance=0.25, peek=True)
     if not rec:
         print("  %s: no record <=25%% of %.0fpx" % (cid, target))
         continue

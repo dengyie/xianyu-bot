@@ -110,10 +110,13 @@ RUN node --version && npm --version
 ENV NODE_PATH=/usr/lib/node_modules
 
 # 使用经过解析和哈希校验的生产依赖锁文件
-COPY requirements.txt requirements.lock ./
+# 只 COPY 锁文件：requirements.lock 由 `--no-emit-package slidex` 生成、**不含 slidex**，
+# 因此第三方依赖不变时这一层恒定。requirements.txt 里带 slidex 的 pin，若在这里一起
+# COPY，改一次 slidex 就换一次本层 digest，后面 600MB 的浏览器层随之整层重建，
+# 线上必须跨境重下整个大层（2026-11-11 实测 nju/1ms 反代均掉到 ~100KB/s，部署挂死）。
+COPY requirements.lock ./
 RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple&& \
-    pip install --no-cache-dir --require-hashes -r requirements.lock -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install --no-cache-dir --no-deps "slidex @ git+https://github.com/dengyie/slidex.git@7461a2634df5dc444d6f767eb80d59a01765395e"
+    pip install --no-cache-dir --require-hashes -r requirements.lock -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 安装Playwright浏览器（只依赖上面装好的 playwright/patchright 包与系统库，不读项目文件）
 # patchright 的 chromium revision（1243）与 playwright 1.59（1223）不同，需各自安装；
@@ -128,6 +131,14 @@ RUN playwright install chromium && \
     ln -sf "$CHROME_BIN" /usr/bin/chromium && \
     ln -sf "$CHROME_BIN" /usr/bin/chromium-browser && \
     ln -sf "$CHROME_BIN" /usr/bin/google-chrome
+
+# slidex 单独一层，排在浏览器层之后：它按 commit pin、升级最频繁，但只装一个纯 Python 包。
+# 放在这里保证一次 pin 变更只新增一个小层，浏览器层与依赖层全部命中缓存。
+# 单一事实源仍是 requirements.txt（禁止另写死 commit，防多处 pin 漂移）。
+COPY requirements.txt ./
+RUN SLIDEX_REQ="$(grep -E '^slidex[[:space:]]*@' requirements.txt | head -1)" && \
+    test -n "$SLIDEX_REQ" && \
+    pip install --no-cache-dir --no-deps "$SLIDEX_REQ"
 
 # 复制项目文件
 COPY . .

@@ -208,24 +208,29 @@ jobs:
           # 镜像名单源：与构建 metadata `images` 同源（工作流级 env.REPO_IMAGE），
           # 千万不要写死或改用 repository.name —— 2026-11-10 分叉事故的根因。
           REPO="${REPO_IMAGE#ghcr.io/}"
-          MIRROR=ghcr.nju.edu.cn
+          # 镜像源按序尝试：2026-11-11 事故——nju 反代单源在 616MB 层上掉到 ~12KB/s，
+          # 20 分钟超时后直连 GHCR 又反复 EOF，整次部署判红。1ms 同层实测可完成，
+          # 故做成列表而非单点，任一源 revision 校验通过即止。
+          MIRRORS="${XIANYU_PULL_MIRRORS:-ghcr.nju.edu.cn ghcr.1ms.run}"
           LOG=/tmp/xianyu_pull.log
           EXITF=/tmp/xianyu_pull.exit
-          echo "=== pull start $(date) short=$SHORT repo=$REPO expect_rev=$EXPECT_REV ===" > "$LOG"
+          echo "=== pull start $(date) short=$SHORT repo=$REPO expect_rev=$EXPECT_REV mirrors=$MIRRORS ===" > "$LOG"
           rc=1
-          echo "--- mirror path: $MIRROR/$REPO:sha-$SHORT ---" >> "$LOG"
-          if timeout 1200 sudo docker pull "$MIRROR/$REPO:sha-$SHORT" >>"$LOG" 2>&1; then
+          for MIRROR in $MIRRORS; do
+            echo "--- mirror path: $MIRROR/$REPO:sha-$SHORT ---" >> "$LOG"
+            timeout 1200 sudo docker pull "$MIRROR/$REPO:sha-$SHORT" >>"$LOG" 2>&1 || continue
             got_rev=$(sudo docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$MIRROR/$REPO:sha-$SHORT" 2>/dev/null || echo "")
             echo "--- mirror image revision=$got_rev expected=$EXPECT_REV ---" >> "$LOG"
             if [ "$got_rev" = "$EXPECT_REV" ]; then
               if sudo docker tag "$MIRROR/$REPO:sha-$SHORT" "ghcr.io/$REPO:latest" >>"$LOG" 2>&1 \
                  && sudo docker tag "$MIRROR/$REPO:sha-$SHORT" "ghcr.io/$REPO:sha-$SHORT" >>"$LOG" 2>&1; then
                 rc=0
+                break
               fi
             else
               echo "--- mirror revision mismatch (stale/lagging mirror); refusing tag ---" >> "$LOG"
             fi
-          fi
+          done
           if [ "$rc" -ne 0 ]; then
             echo "--- mirror path failed; fallback: direct GHCR compose pull ---" >> "$LOG"
             sudo docker compose -f /opt/xianyu-auto-bot/docker-compose.yml pull xianyu-app >>"$LOG" 2>&1 && rc=0

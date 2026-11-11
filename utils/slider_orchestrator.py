@@ -35,6 +35,9 @@ class SliderVerificationResult:
     # 最近一次 /slide 判决码（300=other-punish 等）：失败时让宿主区分
     # "风控惩罚拒绝"与"本地/轨迹失败"，以选择不同退避策略
     slide_code: Optional[int] = None
+    # x5sec 新鲜度（0.11.9 配套）：None=未做新鲜度判定（如人工兜底路径）；
+    # False=票据存在但与解题前相同（旧票原样带回，不算放行）
+    x5_fresh: Optional[bool] = None
     # slide_code 命中风控惩罚码集合（slidex.PUNISH_SLIDE_CODES）的预判布尔，
     # 宿主直接消费，避免自行硬编码惩罚码造成双真相源
     is_punish: bool = False
@@ -100,12 +103,20 @@ def validate_slider_result(
     cookies: Optional[Union[Mapping[str, Any], str]],
     *,
     engine: Optional[str] = DEFAULT_SLIDER_ENGINE,
+    pre_x5sec: Optional[str] = None,
 ) -> SliderVerificationResult:
     """严格判定滑块结果。
 
     旧逻辑只要页面视觉上通过且返回了任意 Cookie 就可能进入成功分支。
     闲鱼/阿里风控下，视觉通过但没有下发 x5sec 时，后续 token 接口仍会
     继续返回验证要求。因此这里强制要求 x5/x5sec 相关 Cookie。
+
+    ``pre_x5sec``（0.11.9 配套）= 解题前宿主已持有的 x5sec 值。票据存在 ≠
+    新下发：容器内浏览器带着旧票解题（同指纹拿不到新票，见 orchestrator
+    CDP 注释）时，旧票会原样出现在回传 Cookie 里，「存在」判定拦不住——
+    2026-11-12 03:07 线上实证：容器 fallback 视觉通过、merge 无 x5sec 变化、
+    token 仍被重判，白耗 600s 沉淀循环。传入 pre_x5sec 后要求 x5sec 值
+    与解题前**不同**才算放行；人工兜底等无基线的调用不传该参，行为不变。
     """
     normalized_engine = str(engine or DEFAULT_SLIDER_ENGINE).strip() or DEFAULT_SLIDER_ENGINE
     if isinstance(cookies, str):
@@ -144,11 +155,30 @@ def validate_slider_result(
             ),
         )
 
+    # 新鲜度闸门：票据必须与解题前不同。x5sec 是带 nonce/签名的票，正常放行
+    # 必然下发新值；与解题前一致 = 旧票原样带回 = 平台没有真正放行。
+    if pre_x5sec:
+        post_x5sec = str(normalized_cookies.get("x5sec") or "")
+        if not post_x5sec or post_x5sec == str(pre_x5sec):
+            return SliderVerificationResult(
+                success=False,
+                cookies=normalized_cookies,
+                engine=normalized_engine,
+                x5_cookies=x5_cookies,
+                x5_fresh=False,
+                message=(
+                    "滑块视觉通过但 x5sec 未刷新（与解题前一致或缺失）——"
+                    "旧票原样带回不算放行，判定为失败；常见于容器内浏览器"
+                    "同指纹解题或 punish 页未真正下发新票"
+                ),
+            )
+
     return SliderVerificationResult(
         success=True,
         cookies=normalized_cookies,
         engine=normalized_engine,
         x5_cookies=x5_cookies,
+        x5_fresh=True if pre_x5sec else None,
         message="滑块验证成功并获取到 x5sec Cookie",
     )
 
@@ -396,8 +426,21 @@ async def run_slider_async_strict(
 
     if _cdp_endpoint_from_env() and hasattr(slider, "solve_on_existing_page"):
         engine = "cdp"
+    # 新鲜度基线：解题前宿主已持有的 x5sec（initial_cookies 是注入浏览器的
+    # 账号 Cookie 面，回退 cookies_str）。回传票据与它一致 = 旧票带回。
+    pre_cookies_str = (
+        str(getattr(slider, "initial_cookies", "") or "")
+        or str(getattr(slider, "cookies_str", "") or "")
+    )
+    pre_x5sec = parse_cookie_string(pre_cookies_str).get("x5sec") if pre_cookies_str else None
     success, cookies = await _invoke_slider_async(slider, url, **kwargs)
-    result = validate_slider_result(success, cookies, engine=engine)
+    result = validate_slider_result(success, cookies, engine=engine, pre_x5sec=pre_x5sec)
+    if result.success is False and result.x5_fresh is False:
+        _uid = getattr(slider, "user_id", None) or getattr(slider, "pure_user_id", None) or "unknown"
+        logger.warning(
+            f"[{_uid}] 滑块视觉通过但 x5sec 未刷新（旧票带回），判定失败——"
+            "不再进入票据沉淀期；请检查 CDP 隧道/调试版 Chrome 是否存活"
+        )
     # slidex 0.6.29 成功链路记录：随结果带给宿主（无记录/旧版 slidex 时为 None）
     record = getattr(slider, "success_record", None)
     if isinstance(record, dict) and record:

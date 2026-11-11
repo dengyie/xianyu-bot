@@ -479,3 +479,40 @@ async def test_cdp_preflight_true_when_response_arrives_in_two_segments():
     finally:
         server.close()
         await server.wait_closed()
+
+
+# ── x5sec 新鲜度闸门（0.11.9 配套）：票据存在 ≠ 新下发 ──
+
+def test_validate_rejects_stale_x5sec():
+    """旧票原样带回（与解题前一致）不算放行——2026-11-12 03:07 容器 fallback
+    视觉通过、merge 无 x5sec 变化、token 仍被重判的根因。"""
+    result = validate_slider_result(
+        True, {"unb": "123", "x5sec": "OLD"}, engine="playwright", pre_x5sec="OLD",
+    )
+    assert result.success is False
+    assert result.x5_fresh is False
+    assert "未刷新" in result.message
+
+
+def test_validate_accepts_fresh_x5sec():
+    result = validate_slider_result(
+        True, {"unb": "123", "x5sec": "NEW"}, engine="playwright", pre_x5sec="OLD",
+    )
+    assert result.success is True
+    assert result.x5_fresh is True
+
+
+def test_validate_without_baseline_keeps_presence_semantics():
+    """无基线（人工兜底等）不传 pre_x5sec：存在即放行，行为与旧版一致。"""
+    result = validate_slider_result(True, {"unb": "1", "x5sec": "t"}, engine="playwright")
+    assert result.success is True
+    assert result.x5_fresh is None
+
+
+def test_validate_missing_x5sec_key_with_baseline_is_stale():
+    """x5_cookies 非空（如只有 x5secdata）但 x5sec 本体缺失 = 票未下发。"""
+    result = validate_slider_result(
+        True, {"unb": "1", "x5secdata": "d"}, engine="playwright", pre_x5sec="OLD",
+    )
+    assert result.success is False
+    assert result.x5_fresh is False

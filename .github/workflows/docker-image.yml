@@ -310,3 +310,34 @@ jobs:
           done
           echo "::error::health check failed after 5 minutes"
           exit 1
+
+      - name: Verify no host file shadows image code
+        # 防"新镜像 + 旧挂载"（2026-11-11 事故）：宿主机 compose 曾把 2026-09-29 的
+        # api_captcha_remote.py / captcha_control.html 以只读层挂进 /app，覆盖镜像内
+        # 新版文件——镜像 revision 校验通过、健康检查照样绿，但线上跑的是六周前代码
+        # （/trajectory 的 400 几何闸门根本没上线）。这里两道闸：
+        #   1) 容器里任何 .py/.html 挂载点直接判红（代码只能随镜像走）；
+        #   2) 关键文件在容器内与镜像内的 sha256 必须一致。
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
+            "REPO_IMAGE=${{ env.REPO_IMAGE }} bash -s" <<'GATE'
+          set -euo pipefail
+          sudo docker inspect xianyu-auto-bot --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' > /tmp/mounts.txt
+          echo "container mount destinations:"; cat /tmp/mounts.txt
+          if grep -E '^/app/.*\.(py|html)$' /tmp/mounts.txt; then
+            echo "::error::宿主机文件挂载覆盖了 /app 内的代码（新镜像 + 旧代码）"
+            exit 1
+          fi
+          for f in api_captcha_remote.py captcha_control.html; do
+            if sudo docker run --rm --entrypoint sh "$REPO_IMAGE:latest" -c "test -f /app/$f" 2>/dev/null; then
+              IMG_SUM=$(sudo docker run --rm --entrypoint sha256sum "$REPO_IMAGE:latest" "/app/$f" | awk '{print $1}')
+              RUN_SUM=$(sudo docker exec xianyu-auto-bot sha256sum "/app/$f" | awk '{print $1}')
+              if [ "$IMG_SUM" != "$RUN_SUM" ]; then
+                echo "::error::$f 在容器内（$RUN_SUM）与镜像内（$IMG_SUM）不一致——被挂载/旧文件覆盖"
+                exit 1
+              fi
+              echo "$f sha256 matches image"
+            fi
+          done
+          GATE
+

@@ -196,16 +196,24 @@ jobs:
         # 覆盖宿主机副本：
         #   1) 先 docker compose config 校验（项目目录不变，宿主机 .env 照常解析）；
         #   2) 拒绝任何 /app/*.py|html 挂载目标——代码只能随镜像走；
-        #   3) 传回的字节必须与仓库 sha256 一致，不一致就不动宿主机文件；
+        #   3) 传回的字节必须与 runner 上 checkout 出来的文件逐字节一致，不一致就
+        #      不动宿主机文件。注意**不能用 hashFiles()**：它对「文件集合（路径+内容）」
+        #      求哈希，不是单文件 sha256，首版用它导致误判（2026-11-11 首次部署实测
+        #      d41fb9cc… != 90d3f1df…，闸门按设计拒绝覆盖、保留原文件）。
         #   4) 替换前把旧文件留档到 /var/tmp，只保留最近 5 份。
         # 主机特定值（密钥、代理地址）仍在宿主机 .env，不随仓库走。
-        env:
-          COMPOSE_SHA: ${{ hashFiles('docker-compose.yml') }}
         run: |
           set -euo pipefail
+          # checkout 必须干净，否则传过去的是工作区而非提交内容
+          if [ -n "$(git status --porcelain -- docker-compose.yml)" ]; then
+            echo "::error::docker-compose.yml 在 runner 上有未提交改动"
+            exit 1
+          fi
+          LOCAL_SUM=$(sha256sum docker-compose.yml | awk '{print $1}')
+          echo "repo compose sha256: $LOCAL_SUM"
           SSH="ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root $SSH_HOST"
           $SSH 'cat > /opt/xianyu-auto-bot/.docker-compose.next.yml' < docker-compose.yml
-          $SSH "COMPOSE_SHA=$COMPOSE_SHA bash -s" <<'SYNC'
+          $SSH "COMPOSE_SHA=$LOCAL_SUM bash -s" <<'SYNC'
           set -euo pipefail
           cd /opt/xianyu-auto-bot
           NEXT=.docker-compose.next.yml

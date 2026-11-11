@@ -65,6 +65,9 @@ services:
       - SLIDEX_CDP_CONNECT_TIMEOUT=${SLIDEX_CDP_CONNECT_TIMEOUT:-45}
       # 轨迹池旋钮（0.11.0 起 SlidexConfig 真正下沉到池实例）。留空走内置默认
       # (1/50/5/lru/0)；RECORDED_ONLY=1 时不回放池内录制厂商轨迹。
+      # 注意 `${VAR:-}` 在 .env 未设置时注入的是**空字符串**而非「未设置」：
+      # slidex 0.11.4 起布尔开关也按「空值视同未设置」处理（`_env.parse_bool`），
+      # 因此这里留空等于取内置默认，不会把轨迹池关掉；显式关闭请写 =0。
       - SLIDEX_TRAJ_POOL_ENABLED=${SLIDEX_TRAJ_POOL_ENABLED:-}
       - SLIDEX_TRAJ_POOL_MAX=${SLIDEX_TRAJ_POOL_MAX:-}
       - SLIDEX_TRAJ_POOL_MIN=${SLIDEX_TRAJ_POOL_MIN:-}

@@ -186,6 +186,62 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
+      - uses: actions/checkout@v4
+
+      - name: Sync compose file to host (single source of truth)
+        # 宿主机 /opt/xianyu-auto-bot/docker-compose.yml 原先是一份手工维护的副本，
+        # 与仓库脱钩：2026-11-11 它还挂着 2026-09-29 的 api_captcha_remote.py / 
+        # captcha_control.html（新镜像 + 旧挂载），而 revision 校验与健康检查只看
+        # 镜像和容器，看不见 compose 本身。此后仓库这份文件是唯一事实源，每次部署
+        # 覆盖宿主机副本：
+        #   1) 先 docker compose config 校验（项目目录不变，宿主机 .env 照常解析）；
+        #   2) 拒绝任何 /app/*.py|html 挂载目标——代码只能随镜像走；
+        #   3) 传回的字节必须与仓库 sha256 一致，不一致就不动宿主机文件；
+        #   4) 替换前把旧文件留档到 /var/tmp，只保留最近 5 份。
+        # 主机特定值（密钥、代理地址）仍在宿主机 .env，不随仓库走。
+        env:
+          COMPOSE_SHA: ${{ hashFiles('docker-compose.yml') }}
+        run: |
+          set -euo pipefail
+          SSH="ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root $SSH_HOST"
+          $SSH 'cat > /opt/xianyu-auto-bot/.docker-compose.next.yml' < docker-compose.yml
+          $SSH "COMPOSE_SHA=$COMPOSE_SHA bash -s" <<'SYNC'
+          set -euo pipefail
+          cd /opt/xianyu-auto-bot
+          NEXT=.docker-compose.next.yml
+          if ! docker compose -f "$NEXT" config -q 2>/tmp/compose_check.err; then
+            echo "::error::新 compose 校验失败，保留宿主机原文件"
+            sed -n '1,20p' /tmp/compose_check.err || true
+            rm -f "$NEXT"
+            exit 1
+          fi
+          docker compose -f "$NEXT" config --format json \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(v.get("target","")) for v in d["services"]["xianyu-app"].get("volumes",[])]' \
+            > /tmp/compose_mounts.txt
+          echo "compose mount targets:"; cat /tmp/compose_mounts.txt
+          if grep -E '^/app/.*\.(py|html)$' /tmp/compose_mounts.txt; then
+            echo "::error::compose 把宿主机代码文件挂进 /app（新镜像 + 旧挂载）"
+            rm -f "$NEXT"
+            exit 1
+          fi
+          NEW_SUM=$(sha256sum "$NEXT" | awk '{print $1}')
+          if [ "$NEW_SUM" != "$COMPOSE_SHA" ]; then
+            echo "::error::传输后的 compose 与仓库不一致（$NEW_SUM != $COMPOSE_SHA）"
+            rm -f "$NEXT"
+            exit 1
+          fi
+          if cmp -s "$NEXT" docker-compose.yml; then
+            echo "compose already in sync ($NEW_SUM)"
+            rm -f "$NEXT"
+          else
+            cp -p docker-compose.yml "/var/tmp/docker-compose.yml.bak.$(date +%Y%m%d-%H%M%S)"
+            install -m 664 -o 1000 -g 1000 "$NEXT" docker-compose.yml
+            rm -f "$NEXT"
+            echo "compose updated -> $(sha256sum docker-compose.yml | awk '{print $1}')"
+          fi
+          ls -1t /var/tmp/docker-compose.yml.bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f || true
+          SYNC
+
       - name: Start pull on tencent (detached)
         # 跨境链路直连 GHCR 实测仅 0.3–3 MB/s:当 apt+Playwright 层(~600MB)digest 变化
         # (Dockerfile 改动 / 构建缓存失效)时,单层需 3–30+ 分钟且频繁 EOF 断流(overlay2

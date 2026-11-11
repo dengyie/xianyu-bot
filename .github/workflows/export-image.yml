@@ -1,0 +1,60 @@
+name: Export Image (break-glass)
+
+# 应急通道：腾讯轻量云到 GHCR/反代的链路饱和时（2026-11-11 实测：nju 先 3.5MB/s
+# 后掉到 ~100KB/s，1ms 同层 15 分钟零进展，直连 GHCR 反复 EOF；单次部署挂死），
+# 由 runner（美国出口，直连 GHCR 数 MB/s）把**已由 CI 构建好的同一镜像**导出为
+# tar.zst，人工下载后 docker load 上线。
+#
+# 刻意不构建：这里只搬运既有镜像，保证线上运行的仍是 CI 产物，不制造第二个构建
+# 真源（2026-11-10 "绿但旧 / 镜像分叉" 事故的教训）。下载后必须核对
+# org.opencontainers.image.revision 与目标 commit 一致，再 tag/recreate。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '镜像标签（sha-<short> / latest / vX.Y.Z）'
+        required: true
+        type: string
+
+env:
+  REPO_IMAGE: ghcr.io/dengyie/xianyu-auto-bot
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and report revision
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REPO_IMAGE }}:${{ inputs.ref }}"
+          docker pull "$IMG"
+          echo "revision=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMG")"
+          echo "uncompressed_bytes=$(docker image inspect --format '{{.Size}}' "$IMG")"
+
+      - name: Save and compress
+        # zstd -3：3.7GB 镜像压到约 1.3GB，落在 upload-artifact 2GB 上限内。
+        # 流式压缩，避免 runner 磁盘同时留 tar 与压缩包。
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REPO_IMAGE }}:${{ inputs.ref }}"
+          docker save "$IMG" | zstd -3 -T0 -q -c > /tmp/image.tar.zst
+          ls -lh /tmp/image.tar.zst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ inputs.ref }}
+          path: /tmp/image.tar.zst
+          retention-days: 3
+          compression-level: 0  # 已是 zstd，别再压一遍白烧 CPU

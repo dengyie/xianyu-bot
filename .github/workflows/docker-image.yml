@@ -466,7 +466,11 @@ jobs:
         # 又回到"新镜像 + 旧挂载"），代价是中途失败会留下"新 compose + 旧容器"的
         # 半态。这里兜回：还原到本次运行之前的内容；只有容器已经按新 compose 重建
         # 过才顺带重建回去。回滚自身失败只降级为 warning——首个错误才是根因。
-        if: failure()
+        # 必须连 cancelled() 一起兜：concurrency 是 cancel-in-progress(push)，部署
+        # 进行中来一个 push，在跑的部署会被静默取消——2026-11-12 00:4x 实证，
+        # 0.11.6 部署在 pytest 阶段被后续 push 取消，failure() 不触发、回滚不跑。
+        # 状态文件按 run id 认领，取消发生在安装前时这里天然 no-op。
+        if: failure() || cancelled()
         run: |
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
             "RUN_ID=${{ github.run_id }} bash -s" <<'ROLLBACK'

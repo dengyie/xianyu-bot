@@ -237,7 +237,7 @@ jobs:
           # 由 test_runtime_gate_uses_the_same_whitelist 钉住两边一致）。
           ALLOWED="/app/data /app/logs /app/global_config.yml /app/backups /app/static/uploads /app/trajectory_history"
           BAD=""
-          while read -r target; do
+          while read -r target || [ -n "$target" ]; do
             case "$target" in
               /app | /app/*)
                 case " $ALLOWED " in
@@ -433,7 +433,7 @@ jobs:
           echo "container mount destinations:"; cat /tmp/mounts.txt
           ALLOWED="/app/data /app/logs /app/global_config.yml /app/backups /app/static/uploads /app/trajectory_history"
           BAD=""
-          while read -r target; do
+          while read -r target || [ -n "$target" ]; do
             case "$target" in
               /app | /app/*)
                 case " $ALLOWED " in

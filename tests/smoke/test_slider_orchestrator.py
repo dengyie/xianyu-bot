@@ -516,3 +516,62 @@ def test_validate_missing_x5sec_key_with_baseline_is_stale():
     )
     assert result.success is False
     assert result.x5_fresh is False
+
+
+# ── 0.11.9 评审修复：大小写归一 / 编码归一 / 远端基线 ──
+
+def test_validate_is_case_insensitive_on_ticket_key():
+    """键名大小写变体不得误杀真票（Findings 1）。"""
+    fresh = validate_slider_result(
+        True, {"unb": "1", "X5Sec": "NEW"}, engine="playwright", pre_x5sec="OLD",
+    )
+    assert fresh.success is True and fresh.x5_fresh is True
+    stale = validate_slider_result(
+        True, {"unb": "1", "X5Sec": "OLD"}, engine="playwright", pre_x5sec="OLD",
+    )
+    assert stale.success is False and stale.x5_fresh is False
+
+
+def test_validate_normalizes_url_encoding_before_compare():
+    """存储串编码形态 vs 浏览器解码形态：同一个票必须判 stale（Findings 2）。"""
+    result = validate_slider_result(
+        True, {"x5sec": "/OLD="}, engine="playwright", pre_x5sec="%2FOLD%3D",
+    )
+    assert result.success is False and result.x5_fresh is False
+
+
+def test_remote_solve_carries_baseline(monkeypatch):
+    """远端路径必须携带基线：旧票从远端带回同样要被拒（Findings 3）。"""
+    import utils.slider_orchestrator as orch
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"success": True, "data": {"cookies": {"x5sec": "OLD"}}}
+
+    monkeypatch.setattr(orch.requests, "post", lambda *a, **k: _Resp())
+    result = orch._call_remote_solve(
+        "https://remote.test/solve",
+        user_id="u1",
+        remote_url="https://remote.test/solve",
+        remote_secret="s",
+        pre_x5sec="OLD",
+    )
+    assert result.success is False and result.x5_fresh is False
+
+
+def test_baseline_helper_prefers_initial_cookies(monkeypatch):
+    """基线取 initial_cookies，缺失回退 cookies_str，都没有则 None。"""
+    import types
+
+    from utils.slider_orchestrator import _baseline_x5sec
+
+    s = types.SimpleNamespace(initial_cookies="a=1; x5sec=FROM_INITIAL",
+                              cookies_str="x5sec=FROM_STR")
+    assert _baseline_x5sec(s) == "FROM_INITIAL"
+    s2 = types.SimpleNamespace(initial_cookies="", cookies_str="x5sec=FROM_STR")
+    assert _baseline_x5sec(s2) == "FROM_STR"
+    s3 = types.SimpleNamespace(initial_cookies="", cookies_str="")
+    assert _baseline_x5sec(s3) is None

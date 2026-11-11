@@ -10,6 +10,7 @@ import asyncio
 from dataclasses import dataclass, replace
 import os
 import requests
+from urllib.parse import unquote
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 from loguru import logger
@@ -78,6 +79,22 @@ def parse_cookie_string(cookie_text: Optional[str]) -> Dict[str, str]:
         if key and key.lower() not in _COOKIE_ATTR_NAMES:
             result[key] = value.strip()
     return result
+
+
+def _baseline_x5sec(slider: Any) -> Optional[str]:
+    """解题前宿主已持有的 x5sec（新鲜度基线）。
+
+    initial_cookies 是注入浏览器的账号 Cookie 面（字符串，0.11.9 起由宿主在
+    构造 solver 时附带）；缺失时回退 cookies_str。两者都没有（人工兜底等
+    无基线路径）返回 None——调用方据此跳过新鲜度闸门，行为与旧版一致。
+    """
+    raw = (
+        str(getattr(slider, "initial_cookies", "") or "")
+        or str(getattr(slider, "cookies_str", "") or "")
+    )
+    if not raw:
+        return None
+    return parse_cookie_string(raw).get("x5sec")
 
 
 def extract_x5_cookies(cookies: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -157,9 +174,15 @@ def validate_slider_result(
 
     # 新鲜度闸门：票据必须与解题前不同。x5sec 是带 nonce/签名的票，正常放行
     # 必然下发新值；与解题前一致 = 旧票原样带回 = 平台没有真正放行。
+    # 取值与存续性闸门同用大小写不敏感语义（extract_x5_cookies 是 case--insensitive
+    # 收集，这里若用精确键会把键名大小写变体的真票误杀）；比对前两侧 unquote
+    # 归一（幂等），防存储串编码形态与浏览器解码形态把同一个票比对成不同。
     if pre_x5sec:
-        post_x5sec = str(normalized_cookies.get("x5sec") or "")
-        if not post_x5sec or post_x5sec == str(pre_x5sec):
+        post_x5sec = next(
+            (str(v) for k, v in x5_cookies.items() if str(k).lower() == "x5sec"),
+            "",
+        )
+        if not post_x5sec or unquote(post_x5sec) == unquote(str(pre_x5sec)):
             return SliderVerificationResult(
                 success=False,
                 cookies=normalized_cookies,
@@ -190,6 +213,7 @@ def _call_remote_solve(
     remote_url: str,
     remote_secret: str,
     timeout: int = 60,
+    pre_x5sec: Optional[str] = None,
 ) -> SliderVerificationResult:
     """调用远程过滑块服务，返回严格判定结果。"""
     try:
@@ -209,13 +233,16 @@ def _call_remote_solve(
         data = data if isinstance(data, dict) else {}
         cookies = data.get("cookies") or data.get("x5_cookies") or data.get("cookie")
         success = bool(payload.get("success") if isinstance(payload, dict) else False)
-        result = validate_slider_result(success, cookies, engine=REMOTE_ENGINE)
+        result = validate_slider_result(
+            success, cookies, engine=REMOTE_ENGINE, pre_x5sec=pre_x5sec,
+        )
         if not result.success and isinstance(payload, dict) and payload.get("message"):
             return SliderVerificationResult(
                 success=False,
                 cookies=result.cookies,
                 engine=REMOTE_ENGINE,
                 x5_cookies=result.x5_cookies,
+                x5_fresh=result.x5_fresh,
                 message=str(payload.get("message")),
             )
         return result
@@ -428,11 +455,7 @@ async def run_slider_async_strict(
         engine = "cdp"
     # 新鲜度基线：解题前宿主已持有的 x5sec（initial_cookies 是注入浏览器的
     # 账号 Cookie 面，回退 cookies_str）。回传票据与它一致 = 旧票带回。
-    pre_cookies_str = (
-        str(getattr(slider, "initial_cookies", "") or "")
-        or str(getattr(slider, "cookies_str", "") or "")
-    )
-    pre_x5sec = parse_cookie_string(pre_cookies_str).get("x5sec") if pre_cookies_str else None
+    pre_x5sec = _baseline_x5sec(slider)
     success, cookies = await _invoke_slider_async(slider, url, **kwargs)
     result = validate_slider_result(success, cookies, engine=engine, pre_x5sec=pre_x5sec)
     if result.success is False and result.x5_fresh is False:
@@ -485,6 +508,8 @@ async def run_slider_async_with_fallback(
     use_remote = _env_bool("XY_SLIDER_REMOTE_ENABLED", False) if remote_enabled is None else bool(remote_enabled)
     remote_url, remote_secret = remote_config or _remote_config_from_env()
     if use_remote and remote_url and remote_secret:
+        # 远端结果同样过新鲜度闸：不传基线的话，远端带回旧票会被「存在即放行」
+        # 放过，幻影成功从远端旁路回归（0.11.9 评审 Findings 3）。
         remote_result = await asyncio.to_thread(
             _call_remote_solve,
             url,
@@ -492,6 +517,7 @@ async def run_slider_async_with_fallback(
             remote_url=remote_url,
             remote_secret=remote_secret,
             timeout=remote_timeout,
+            pre_x5sec=_baseline_x5sec(slider),
         )
         if remote_result.success:
             return remote_result

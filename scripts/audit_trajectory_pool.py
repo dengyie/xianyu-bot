@@ -94,14 +94,21 @@ for cid in cookies:
         print("     dup:", a, "<->", b)
 
 section("4. offline replay smoothness")
+print("  probe path: load_unused_human(peek=True) —— 与生产选轨同一条路")
 for cid in cookies:
-    target = 400.0
     pool = SliderTrajectoryPool(base_dir=BASE)
+    human = [r for r in pool._load_all(cid)
+             if r.get("success") and str(r.get("source") or "").startswith("human")]
+    if not human:
+        print("  %s: no human recording, skip" % cid)
+        continue
+    dists = sorted(float(r.get("distance") or 0.0) for r in human)
+    target = dists[len(dists) // 2]
     # peek=True：审计是只读探针，不得推进 LRU 时钟（slidex>=0.11.6 的 peek 语义，
     # 0.11.5 及更早的池会把审计跑成一次 last_used 写盘）。
-    rec = pool.load_best_trajectory(cid, target, distance_tolerance=0.25, peek=True)
+    rec = pool.load_unused_human(cid, target, peek=True)
     if not rec:
-        print("  %s: no record <=25%% of %.0fpx" % (cid, target))
+        print("  %s: load_unused_human(%.0fpx) -> None (unexpected)" % (cid, target))
         continue
     plan = GestureSession._plan_from_human_rec(rec, target)
     if plan is None:

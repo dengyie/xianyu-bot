@@ -266,8 +266,8 @@ async def run_human_captcha_session(
 
                     # 录制本次人工拖拽轨迹并落盘到 slidex 轨迹池：
                     # solver 下次自动求解会优先回放（GestureSession 经
-                    # load_unused_human 按 pure_user_id + 距离选「最旧编号」的
-                    # 未用录制），实现“记录好我的操作”并复现。
+                    # load_unused_human 按 pure_user_id + 距离 + lru「最久未用」
+                    # 选未用录制，0.11.7 起），实现“记录好我的操作”并复现。
                     try:
                         if hasattr(captcha_controller, "finish_recording"):
                             recording = captcha_controller.finish_recording(session_id)

@@ -188,19 +188,24 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Sync compose file to host (single source of truth)
+      - name: Install compose file on host (single source of truth)
         # 宿主机 /opt/xianyu-auto-bot/docker-compose.yml 原先是一份手工维护的副本，
-        # 与仓库脱钩：2026-11-11 它还挂着 2026-09-29 的 api_captcha_remote.py / 
+        # 与仓库脱钩：2026-11-11 它还挂着 2026-09-29 的 api_captcha_remote.py /
         # captcha_control.html（新镜像 + 旧挂载），而 revision 校验与健康检查只看
-        # 镜像和容器，看不见 compose 本身。此后仓库这份文件是唯一事实源，每次部署
-        # 覆盖宿主机副本：
+        # 镜像和容器，看不见 compose 本身。此后仓库这份文件是唯一事实源。
         #   1) 先 docker compose config 校验（项目目录不变，宿主机 .env 照常解析）；
-        #   2) 拒绝任何 /app/*.py|html 挂载目标——代码只能随镜像走；
+        #   2) /app 下只允许 ALLOWED 这 6 个数据/配置目标——白名单而非
+        #      "*.py|html 后缀黑名单"：`.:/app`、`/app/<dir>`、`/app/x.json` 都
+        #      不满足后缀判据，却同样能盖住镜像内容；
         #   3) 传回的字节必须与 runner 上 checkout 出来的文件逐字节一致，不一致就
         #      不动宿主机文件。注意**不能用 hashFiles()**：它对「文件集合（路径+内容）」
         #      求哈希，不是单文件 sha256，首版用它导致误判（2026-11-11 首次部署实测
-        #      d41fb9cc… != 90d3f1df…，闸门按设计拒绝覆盖、保留原文件）。
-        #   4) 替换前把旧文件留档到 /var/tmp，只保留最近 5 份。
+        #      d41fb9cc… != 90d3f1df…，闸门按设计拒绝覆盖、保留原文件）；
+        #   4) 替换前把旧文件留档到 /var/tmp（只保留最近 5 份），并写
+        #      /var/tmp/compose_swap.state 作为回滚凭证；job 后续任一步失败时
+        #      "Roll back compose on failure" 把宿主机 compose 还原成本次运行之前的样子。
+        # 本步骤被 paths-ignore 的 '.github/**' 排除，改动它不会触发构建——
+        # 改完必须手工 `gh workflow run 282526695 --ref main` 验证一次。
         # 主机特定值（密钥、代理地址）仍在宿主机 .env，不随仓库走。
         run: |
           set -euo pipefail
@@ -213,7 +218,7 @@ jobs:
           echo "repo compose sha256: $LOCAL_SUM"
           SSH="ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root $SSH_HOST"
           $SSH 'cat > /opt/xianyu-auto-bot/.docker-compose.next.yml' < docker-compose.yml
-          $SSH "COMPOSE_SHA=$LOCAL_SUM bash -s" <<'SYNC'
+          $SSH "COMPOSE_SHA=$LOCAL_SUM RUN_ID=${{ github.run_id }} bash -s" <<'SYNC'
           set -euo pipefail
           cd /opt/xianyu-auto-bot
           NEXT=.docker-compose.next.yml
@@ -227,24 +232,59 @@ jobs:
             | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(v.get("target","")) for v in d["services"]["xianyu-app"].get("volumes",[])]' \
             > /tmp/compose_mounts.txt
           echo "compose mount targets:"; cat /tmp/compose_mounts.txt
-          if grep -E '^/app/.*\.(py|html)$' /tmp/compose_mounts.txt; then
-            echo "::error::compose 把宿主机代码文件挂进 /app（新镜像 + 旧挂载）"
+          # 白名单：/app 与 /app/* 只准出现在 ALLOWED 里的目标（与
+          # tests/unit/test_compose_no_source_mounts.py 的 ALLOWED_APP_TARGETS 同源，
+          # 由 test_runtime_gate_uses_the_same_whitelist 钉住两边一致）。
+          ALLOWED="/app/data /app/logs /app/global_config.yml /app/backups /app/static/uploads /app/trajectory_history"
+          BAD=""
+          while read -r target; do
+            case "$target" in
+              /app | /app/*)
+                case " $ALLOWED " in
+                  *" $target "*) ;;
+                  *) BAD="$BAD $target" ;;
+                esac
+                ;;
+            esac
+          done < /tmp/compose_mounts.txt
+          if [ -n "$BAD" ]; then
+            echo "::error::compose 在 /app 下挂了白名单之外的目标（新镜像 + 旧挂载）：$BAD"
             rm -f "$NEXT"
             exit 1
           fi
           NEW_SUM=$(sha256sum "$NEXT" | awk '{print $1}')
           if [ "$NEW_SUM" != "$COMPOSE_SHA" ]; then
-            echo "::error::传输后的 compose 与仓库不一致（$NEW_SUM != $COMPOSE_SHA）"
+            echo "::error::传输后的 compose 与仓库不一致（$NEW_SUM != ${COMPOSE_SHA}）"
             rm -f "$NEXT"
             exit 1
           fi
+          # 同目录 mv = rename(2)，原子替换：读者要么看到旧文件、要么看到新文件，
+          # 不会看到半截 YAML（install 是原地 O_TRUNC 写，中途断连会留下坏文件，
+          # 后续所有 docker compose 调用连 pull 都起不来）。
+          chmod 664 "$NEXT"
+          # 用 compose 自己解析出的 user（${APP_UID:-1000}:${APP_GID:-1000}）而不是写死
+          # 1000:1000：宿主机 .env 改了 APP_UID 后，compose 文件不至于变成别人的文件。
+          OWNER=$(docker compose -f "$NEXT" config --format json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["xianyu-app"].get("user") or "1000:1000")')
+          chown "$OWNER" "$NEXT" 2>/dev/null || true
           if cmp -s "$NEXT" docker-compose.yml; then
             echo "compose already in sync ($NEW_SUM)"
             rm -f "$NEXT"
+            rm -f /var/tmp/compose_swap.state
           else
-            cp -p docker-compose.yml "/var/tmp/docker-compose.yml.bak.$(date +%Y%m%d-%H%M%S)"
-            install -m 664 -o 1000 -g 1000 "$NEXT" docker-compose.yml
-            rm -f "$NEXT"
+            # 回滚凭证：写状态文件记下"替换前是什么"，job 后续任一步失败时由
+            # "Roll back compose on failure" 还原。用状态文件而不是 ls 猜最新备份，
+            # 并用 run id 认领——否则本次在安装前就失败时，会把上一次部署的备份
+            # 当成自己的回滚目标，等于无谓降级。
+            {
+              echo "run=$RUN_ID"
+              if [ -f docker-compose.yml ]; then
+                BAK="/var/tmp/docker-compose.yml.bak.$(date +%Y%m%d-%H%M%S)"
+                cp -p docker-compose.yml "$BAK"
+                echo "backup=$BAK"
+              fi
+            } > /var/tmp/compose_swap.state
+            mv -f "$NEXT" docker-compose.yml
             echo "compose updated -> $(sha256sum docker-compose.yml | awk '{print $1}')"
           fi
           ls -1t /var/tmp/docker-compose.yml.bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f || true
@@ -356,7 +396,8 @@ jobs:
       - name: Recreate container on tencent
         run: |
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
-            'sudo docker compose -f /opt/xianyu-auto-bot/docker-compose.yml up -d --no-build --no-deps --force-recreate xianyu-app'
+            'set -e; sudo docker compose -f /opt/xianyu-auto-bot/docker-compose.yml up -d --no-build --no-deps --force-recreate xianyu-app
+             if [ -f /var/tmp/compose_swap.state ]; then echo "recreated=1" >> /var/tmp/compose_swap.state; fi'
 
       - name: Health check
         # 冷启动可能数分钟才 healthy，单次 sleep+curl 会误报红；
@@ -380,7 +421,9 @@ jobs:
         # api_captcha_remote.py / captcha_control.html 以只读层挂进 /app，覆盖镜像内
         # 新版文件——镜像 revision 校验通过、健康检查照样绿，但线上跑的是六周前代码
         # （/trajectory 的 400 几何闸门根本没上线）。这里两道闸：
-        #   1) 容器里任何 .py/.html 挂载点直接判红（代码只能随镜像走）；
+        #   1) /app 与 /app/* 只准出现白名单里的数据/配置目标（判据与安装 compose 那
+        #      一步、tests/unit/test_compose_no_source_mounts.py 完全一致：后缀黑名单
+        #      只拦得住 "*.py|html 单文件"，`.:/app`、`/app/<dir>`、`/app/x.json` 全能过）；
         #   2) 关键文件在容器内与镜像内的 sha256 必须一致。
         run: |
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
@@ -388,8 +431,20 @@ jobs:
           set -euo pipefail
           sudo docker inspect xianyu-auto-bot --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' > /tmp/mounts.txt
           echo "container mount destinations:"; cat /tmp/mounts.txt
-          if grep -E '^/app/.*\.(py|html)$' /tmp/mounts.txt; then
-            echo "::error::宿主机文件挂载覆盖了 /app 内的代码（新镜像 + 旧代码）"
+          ALLOWED="/app/data /app/logs /app/global_config.yml /app/backups /app/static/uploads /app/trajectory_history"
+          BAD=""
+          while read -r target; do
+            case "$target" in
+              /app | /app/*)
+                case " $ALLOWED " in
+                  *" $target "*) ;;
+                  *) BAD="$BAD $target" ;;
+                esac
+                ;;
+            esac
+          done < /tmp/mounts.txt
+          if [ -n "$BAD" ]; then
+            echo "::error::宿主机文件挂载覆盖了 /app 内白名单之外的目标（新镜像 + 旧代码）：$BAD"
             exit 1
           fi
           for f in api_captcha_remote.py captcha_control.html; do
@@ -397,7 +452,7 @@ jobs:
               IMG_SUM=$(sudo docker run --rm --entrypoint sha256sum "$REPO_IMAGE:latest" "/app/$f" | awk '{print $1}')
               RUN_SUM=$(sudo docker exec xianyu-auto-bot sha256sum "/app/$f" | awk '{print $1}')
               if [ "$IMG_SUM" != "$RUN_SUM" ]; then
-                echo "::error::$f 在容器内（$RUN_SUM）与镜像内（$IMG_SUM）不一致——被挂载/旧文件覆盖"
+                echo "::error::$f 在容器内（${RUN_SUM}）与镜像内（${IMG_SUM}）不一致——被挂载/旧文件覆盖"
                 exit 1
               fi
               echo "$f sha256 matches image"
@@ -405,3 +460,53 @@ jobs:
           done
           GATE
 
+
+      - name: Roll back compose on failure
+        # compose 必须在拉镜像/重建**之前**安装（重建容器读的就是这份文件，晚装就
+        # 又回到"新镜像 + 旧挂载"），代价是中途失败会留下"新 compose + 旧容器"的
+        # 半态。这里兜回：还原到本次运行之前的内容；只有容器已经按新 compose 重建
+        # 过才顺带重建回去。回滚自身失败只降级为 warning——首个错误才是根因。
+        if: failure()
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
+            "RUN_ID=${{ github.run_id }} bash -s" <<'ROLLBACK'
+          set -u
+          STATE=/var/tmp/compose_swap.state
+          if [ ! -f "$STATE" ]; then
+            echo "本次运行没有替换过 compose，无需回滚"
+            exit 0
+          fi
+          OWNER=$(sed -n 's/^run=//p' "$STATE")
+          if [ "$OWNER" != "${RUN_ID:-}" ]; then
+            echo "compose_swap.state 属于 run=${OWNER}，不是本次运行（${RUN_ID}），跳过"
+            exit 0
+          fi
+          BAK=$(sed -n 's/^backup=//p' "$STATE")
+          RECREATED=0; grep -q '^recreated=1' "$STATE" && RECREATED=1
+          cd /opt/xianyu-auto-bot || { echo "::warning::/opt/xianyu-auto-bot 不存在"; exit 0; }
+          if [ -n "$BAK" ] && [ -f "$BAK" ]; then
+            cp -p "$BAK" docker-compose.yml.restoring
+            mv -f docker-compose.yml.restoring docker-compose.yml
+            echo "compose restored from $BAK -> $(sha256sum docker-compose.yml | awk '{print $1}')"
+          elif [ -n "$BAK" ]; then
+            echo "::warning::回滚备份 $BAK 已不存在，保留当前 compose"
+            rm -f "$STATE"
+            exit 0
+          else
+            rm -f docker-compose.yml
+            echo "compose removed（本次运行前宿主机没有这个文件）"
+          fi
+          rm -f "$STATE"
+          if [ "$RECREATED" = 1 ] && [ -f docker-compose.yml ]; then
+            sudo docker compose -f docker-compose.yml up -d --no-build --no-deps --force-recreate xianyu-app \
+              || echo "::warning::回滚后重建容器失败，线上仍是新 compose 的挂载，需人工确认"
+          fi
+          ROLLBACK
+
+      - name: Clear compose swap marker
+        # 全绿 = compose 已被这次运行的内容验证通过，标记必须清掉：留着它，下一次
+        # 运行若在安装前就失败，回滚步骤会误认领并还原一份旧文件（等于降级）。
+        if: success()
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o User=root "$SSH_HOST" \
+            'rm -f /var/tmp/compose_swap.state'

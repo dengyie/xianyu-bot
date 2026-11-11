@@ -9,7 +9,9 @@ plugins=数字数组。风控 JS 读三个只读属性即零成本判自动化�
 修复落在 slidex 6b3190a（_get_headful_stealth_script + userAgentData 一致性
 + 删除数字 plugins 注入）。本文件钉死两件事：
 
-1. 两处 pin（Dockerfile / requirements.txt）必须指向同一 commit，防止改一漏一；
+1. pin 只有 requirements.txt 一个事实源——Dockerfile 必须从它 grep 出来安装，
+   绝不能再硬编码第二个 commit（硬编码正是 2026-11-11「改一次 pin 让 pip 层
+   digest 变化、连带 600MB 浏览器层整层重建、线上跨境重下卡死」的根因）；
 2. 实际安装的 slidex 必须真的带该修复——任何人把 pin 挪到没有修复的版本
    （含上游回退），这里直接失败。
 """
@@ -21,24 +23,22 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 PIN_PATTERN = r"slidex @ git\+https://github\.com/dengyie/slidex\.git@([0-9a-f]+)"
+GREP_PATTERN = r"grep -E '\^slidex\[\[:space:\]\]\*@' requirements\.txt"
 
 
-def _pins():
+def test_slidex_pin_only_in_requirements():
+    """pin 单点事实源：requirements.txt 有，Dockerfile 不得再硬编码。"""
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-    return (
-        re.search(PIN_PATTERN, dockerfile),
-        re.search(PIN_PATTERN, requirements),
+
+    assert re.search(PIN_PATTERN, requirements), "requirements.txt 缺少 slidex pin"
+    assert not re.search(PIN_PATTERN, dockerfile), (
+        "Dockerfile 又硬编码了 slidex pin：两个事实源必然漂移，且会让 pip 层"
+        "随 pin 变更失效、连带浏览器层整层重建"
     )
-
-
-def test_slidex_pin_present_in_both_locations_and_identical():
-    docker_pin, requirements_pin = _pins()
-
-    assert docker_pin, "Dockerfile 缺少 slidex pin"
-    assert requirements_pin, "requirements.txt 缺少 slidex pin"
-    assert docker_pin.group(1) == requirements_pin.group(1), (
-        f"两处 pin 不一致: {docker_pin.group(1)} vs {requirements_pin.group(1)}"
+    # 删掉硬编码后必须仍从 requirements.txt 取值，否则等于压根没装 slidex
+    assert re.search(GREP_PATTERN, dockerfile), (
+        "Dockerfile 未从 requirements.txt 提取 slidex pin 安装"
     )
 
 

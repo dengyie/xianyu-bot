@@ -69,9 +69,10 @@ while ($true) {
     }
 
     Write-Host "[cdp-tunnel] $(Get-Date -Format 'HH:mm:ss') tunnel starting..."
-    ssh -N -R "$($RemoteBind):localhost:$($LocalPort)" `
+    ssh -N -R "$($RemoteBind):127.0.0.1:$($LocalPort)" `
         -o ServerAliveInterval=15 -o ServerAliveCountMax=3 `
         -o ExitOnForwardFailure=yes -o ConnectTimeout=20 $SshHost
     Write-Host "[cdp-tunnel] $(Get-Date -Format 'HH:mm:ss') tunnel exited (code=$LASTEXITCODE), reconnecting in 5s..."
     Start-Sleep -Seconds 5
 }
+

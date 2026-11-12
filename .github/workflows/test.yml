@@ -1,16 +1,9 @@
 name: Test
 
 on:
-  push:
-    # 与 docker-image.yml 的 paths-ignore 对齐：纯文档/运维/CI 提交不烧 pytest
-    # （docs 提交每次白跑 4-5 分钟 runner）。
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'scripts/**'
-      - '.github/**'
+  # push 到 main 的 pytest 由 docker-image.yml 的 pytest 门禁承担（2026-11-13 去重）：
+  # 之前 push 一次代码 Test 与 build 流水线的 pytest 各跑一遍，同样的测试双份 runner。
+  # 这里只保留 PR 场景——PR 不触发 build 流水线，没有 Test 就没有测试覆盖。
   pull_request:
     paths-ignore:
       - '**.md'

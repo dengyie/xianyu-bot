@@ -2,7 +2,7 @@ import asyncio
 import time
 import aiohttp
 from loguru import logger
-from utils.xianyu_utils import trans_cookies, generate_sign
+from utils.xianyu_utils import trans_cookies, generate_sign, split_blank_set_cookie_updates
 
 
 class SecureFreeshipping:
@@ -63,13 +63,40 @@ class SecureFreeshipping:
             updates[name.strip()] = value.strip()
         return updates
 
+    def _split_cookie_updates(self, updates):
+        """空值 Set-Cookie 分流——免运费发货与主链/确认发货写同一份 Cookie。
+
+        闲鱼会下发 `unb=` 这类空 Set-Cookie，直接合并会把关键字段覆盖成空串，
+        账号 ID 从 Cookie 里消失。与主链
+        xianyu_cookie_mixin._drop_blank_protected_cookie_overwrites 同语义，
+        共用实现在 utils.xianyu_utils.split_blank_set_cookie_updates。
+        """
+        try:
+            from XianyuAutoAsync import PROTECTED_SESSION_COOKIE_FIELDS as protected_fields
+        except Exception:
+            protected_fields = ()
+        writes, removals, dropped = split_blank_set_cookie_updates(
+            updates, self.cookies, protected_fields
+        )
+        if dropped:
+            logger.warning(
+                f"【{self.cookie_id}】忽略响应中的空关键Cookie字段，保留现有会话值: {', '.join(dropped)}"
+            )
+        return writes, removals
+
     async def _apply_response_cookie_updates(self, response_headers):
         updates = self._extract_set_cookie_updates(response_headers)
         if not updates:
             return False
 
+        writes, removals = self._split_cookie_updates(updates)
+        if not writes and not removals:
+            return False
+
         merged_cookies = dict(self.cookies)
-        merged_cookies.update(updates)
+        merged_cookies.update(writes)
+        for name in removals:
+            merged_cookies.pop(name, None)
         changed = self._set_runtime_cookie_state(cookies_dict=merged_cookies)
         if changed:
             await self.update_config_cookies()

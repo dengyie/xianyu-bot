@@ -8,7 +8,7 @@ import json
 import time
 import aiohttp
 from loguru import logger
-from utils.xianyu_utils import generate_sign, trans_cookies
+from utils.xianyu_utils import generate_sign, trans_cookies, split_blank_set_cookie_updates
 
 
 class SecureConfirm:
@@ -79,34 +79,21 @@ class SecureConfirm:
         return updates
 
     def _split_cookie_updates(self, updates):
-        """把 Set-Cookie 拆成「要写的」和「要删的」。
+        """空值 Set-Cookie 分流——自动确认发货与主链写的是同一账号同一份 Cookie。
 
-        空值 Set-Cookie 不能一律当新值写：闲鱼在恢复链路里会下发 `unb=` 这类空
-        字段，直接合并会把关键字段覆盖成空串，账号 ID 从 Cookie 里消失（下次
-        扫码认不回原账号）。主链 xianyu_cookie_mixin._drop_blank_protected_cookie_overwrites
-        的处理是「关键字段保留旧值」；自动确认发货写的是同一账号同一份 Cookie，
-        两套逻辑必须一致，否则改库结果取决于谁后写。
-        非关键字段的空值是服务端在注销该 Cookie，按删除处理，不留 `k=` 空壳。
+        闲鱼在恢复链路会下发 `unb=` 这类空字段，直接合并会把关键字段覆盖成空串，
+        账号 ID 从 Cookie 里消失（下次扫码认不回原账号）。分流实现与主链
+        xianyu_cookie_mixin._drop_blank_protected_cookie_overwrites 同语义，
+        共用代码在 utils.xianyu_utils.split_blank_set_cookie_updates，两套逻辑
+        必须一致，否则改库结果取决于谁后写。
         """
         try:
             from XianyuAutoAsync import PROTECTED_SESSION_COOKIE_FIELDS as protected_fields
         except Exception:
             protected_fields = ()
-        protected = set(protected_fields or ())
-        existing = self.cookies if isinstance(self.cookies, dict) else {}
-
-        writes = {}
-        removals = []
-        dropped = []
-        for name, value in (updates or {}).items():
-            blank = not str(value or '').strip()
-            if blank and name in protected and str(existing.get(name) or '').strip():
-                dropped.append(name)
-                continue
-            if blank:
-                removals.append(name)
-                continue
-            writes[name] = value
+        writes, removals, dropped = split_blank_set_cookie_updates(
+            updates, self.cookies, protected_fields
+        )
         if dropped:
             logger.warning(
                 f"【{self.cookie_id}】忽略响应中的空关键Cookie字段，保留现有会话值: {', '.join(dropped)}"

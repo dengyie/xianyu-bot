@@ -80,6 +80,50 @@ def trans_cookies(cookies_str: str) -> dict:
     return cookies
 
 
+def split_blank_set_cookie_updates(
+    updates: Any,
+    existing_cookies: Any,
+    protected_fields: Any = (),
+) -> tuple:
+    """空值 Set-Cookie 分流，确认发货/免运费等旁路模块共用（三方一致）。
+
+    闲鱼会在恢复/发货链路下发 `unb=` 这类空 Set-Cookie。空值不是新会话值：
+    - 关键会话字段（protected_fields）已有非空值时忽略覆盖，否则账号 ID 等会
+      被清空，下次扫码认不回原账号（主链同语义实现见
+      xianyu_cookie_mixin._drop_blank_protected_cookie_overwrites）；
+    - 其余空值视为服务端注销该 Cookie，按删除处理，不留 `k=` 空壳——
+      trans_cookies 解析时本就会丢弃空值，写进去与删掉等价，删除更直白。
+
+    Args:
+        updates: _extract_set_cookie_updates 的产出 {name: value}
+        existing_cookies: 当前实例内存 Cookie 字典
+        protected_fields: 关键会话字段集合（来自
+            XianyuAutoAsync.PROTECTED_SESSION_COOKIE_FIELDS，调用方惰性传入）
+
+    Returns:
+        (writes, removals, dropped)
+        writes:   应写入的新值 {name: value}
+        removals: 应删除的字段名列表
+        dropped:  因保护而被忽略的空关键字段列表（调用方负责告警）
+    """
+    protected = set(protected_fields or ())
+    existing = existing_cookies if isinstance(existing_cookies, dict) else {}
+
+    writes: Dict[str, str] = {}
+    removals: List[str] = []
+    dropped: List[str] = []
+    for name, value in (updates or {}).items():
+        blank = not str(value or '').strip()
+        if blank and name in protected and str(existing.get(name) or '').strip():
+            dropped.append(name)
+            continue
+        if blank:
+            removals.append(name)
+            continue
+        writes[name] = value
+    return writes, removals, dropped
+
+
 def generate_mid() -> str:
     """生成mid"""
     import random

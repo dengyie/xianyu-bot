@@ -1136,7 +1136,10 @@ Cookie数量: {cookie_count}
                     int(duration_ms) if duration_ms is not None else None,
                 ))
                 self.conn.commit()
-                return cursor.lastrowid
+                log_id = cursor.lastrowid
+            # 放在锁外：保留期 DELETE 自带 try/except，不会让一次成功的写入变成 None
+            self._cleanup_risk_logs_from_setting()
+            return log_id
         except Exception as e:
             logger.error(f"添加风控日志失败: {e}")
             return None

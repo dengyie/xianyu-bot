@@ -141,6 +141,7 @@ class DBBase:
         self.secret_fernet = None
         self.secret_key_path = None
         self._last_audit_cleanup_at = 0.0
+        self._last_risk_log_cleanup_at = 0.0
 
         # SQL日志配置 - 默认启用
         self.sql_log_enabled = False  # 默认关闭SQL日志，避免生产日志泄露业务数据
@@ -2527,6 +2528,50 @@ Cookie数量: {cookie_count}
             if deleted > 0:
                 logger.info(f"清理过期审计日志 {deleted} 条，保留 {retention_days} 天")
             return deleted
+
+    def cleanup_risk_control_logs(self, days: int = 90) -> int:
+        """Delete risk-control logs older than the retention window and return deleted count.
+
+        risk_control_logs 只增不减：每次滑块失败/风控拦截写一条，8 月至今已累计
+        12 万行。审计日志有 90 天保留策略，风控日志此前没有，DB 会随账号年龄线性膨胀。
+        默认 90 天，可被 system_settings.risk_control_log_retention_days 覆盖；
+        设 0 或负数表示不清理。
+        """
+        retention_days = int(days or 0)
+        if retention_days <= 0:
+            return 0
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "DELETE FROM risk_control_logs WHERE datetime(created_at) < datetime('now', '-' || ? || ' days')",
+                (retention_days,),
+            )
+            deleted = cursor.rowcount
+            self.conn.commit()
+            if deleted > 0:
+                logger.info(f"清理过期风控日志 {deleted} 条，保留 {retention_days} 天")
+            return deleted
+
+    def _cleanup_risk_logs_from_setting(self) -> None:
+        """Best-effort risk-log retention cleanup after writes (hourly at most).
+
+        挂在风控日志写入后而不是定时任务里：没有独立调度器，写日志本身就是
+        “到了需要清理的时候”的信号；一小时最多扫一次，DELETE 走 created_at 索引
+        规划，行数不大时开销可忽略。
+        """
+        try:
+            now = time.time()
+            if now - self._last_risk_log_cleanup_at < 3600:
+                return
+            self._last_risk_log_cleanup_at = now
+            raw = self.get_system_setting("risk_control_log_retention_days")
+            try:
+                retention_days = int(str(raw).strip()) if raw not in (None, "") else 90
+            except (TypeError, ValueError):
+                retention_days = 90
+            self.cleanup_risk_control_logs(retention_days)
+        except Exception as e:
+            logger.warning(f"清理风控日志失败: {e}")
 
     def _cleanup_audit_logs_from_setting(self) -> None:
         """Best-effort audit retention cleanup after writes."""

@@ -1284,6 +1284,20 @@ class XianyuAuthRecoveryMixin:
         except Exception as notify_e:  # noqa: BLE001 通知失败不影响退避与解锁
             logger.warning(f"【{self.cookie_id}】发送登录超时通知失败: {self._safe_str(notify_e)}")
 
+    def _has_active_same_account_slider_session(self) -> bool:
+        """同账号是否已有滑块会话在跑（含正在等人工扫码的那一个）。
+
+        查询失败按「无会话」处理：宁可照旧走一次登录，也不能因为探测异常
+        把刷新链路整体挡死。
+        """
+        try:
+            from slidex._concurrency import concurrency_manager
+
+            return bool(concurrency_manager.has_same_account_active(self.cookie_id))
+        except Exception as probe_e:
+            logger.debug(f"【{self.cookie_id}】查询同账号滑块会话失败，按无会话处理: {self._safe_str(probe_e)}")
+            return False
+
     async def _try_password_login_refresh(
         self,
         trigger_reason: str = "令牌/Session过期",
@@ -1515,6 +1529,29 @@ class XianyuAuthRecoveryMixin:
                     )
                 return False
             
+            if self._has_active_same_account_slider_session():
+                # 同账号并发去重是 slidex 的设计：第二个实例必然排在队列里等槽位，
+                # 60 秒后抛「滑块验证等待槽位超时」。2026-11-13 18:32:53 的
+                # 「密码登录刷新失败，Cookie可能仍然无效」正是这个组合——18:23 那次
+                # 登录正在等人工扫码，18:31 的定时刷新又来了一个。让路，而不是记成失败。
+                defer_message = "同账号已有滑块/人工验证会话在跑，本次自动密码登录刷新让路"
+                logger.warning(f"【{self.cookie_id}】{defer_message}，跳过本次刷新")
+                if refresh_risk_log_id:
+                    self._update_risk_log(
+                        refresh_risk_log_id,
+                        session_id=risk_session_id,
+                        trigger_scene=trigger_scene,
+                        result_code='verification_in_progress',
+                        processing_status='failed',
+                        error_message=defer_message,
+                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                        event_meta=self._build_risk_event_meta(
+                            trigger_scene=trigger_scene,
+                            extra={**base_event_meta, 'deferred': True},
+                        ),
+                    )
+                return False
+
             # 使用集成的 Playwright 登录方法（slidex）
             from slidex.stealth import XianyuSliderStealth
             from slidex import SlidexConfig as _SlidexConfig

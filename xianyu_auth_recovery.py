@@ -143,22 +143,36 @@ class XianyuAuthRecoveryMixin:
 
     @classmethod
     def _cleanup_manual_refresh_state(cls):
-        """清理过期的刷新交接恢复状态。"""
+        """清理过期的刷新交接恢复状态。
+
+        manual_refresh 同样要有硬 TTL:它的唯一解除路径是 UI 登录线程的 finally,
+        而那个线程没有超时保护(自动链路正是因为这个才用 wait_for 包住同一个调用)。
+        线程若在 Chromium/CDP 假死时永远不返回,finally 不会执行,is_manual_refresh_active
+        就会永久压制该账号的自动密码登录、自动 Cookie 刷新、token 恢复和保活——
+        静默停摆直到进程重启(2026-11-15 review)。
+        """
         now = time.time()
         expired_cookie_ids = []
+        expired_manual = []
         with cls._manual_refresh_lock:
             for cookie_id, state in cls._manual_refresh_state.items():
-                if state.get('phase') != 'handoff_recovery':
-                    continue
                 expires_at = state.get('expires_at', 0)
-                if expires_at and now > expires_at:
-                    expired_cookie_ids.append(cookie_id)
+                if not expires_at or now <= expires_at:
+                    continue
+                expired_cookie_ids.append(cookie_id)
+                if state.get('phase') == 'manual_refresh':
+                    expired_manual.append(cookie_id)
 
             for cookie_id in expired_cookie_ids:
                 cls._manual_refresh_state.pop(cookie_id, None)
 
         for cookie_id in expired_cookie_ids:
-            logger.warning(f"【{cookie_id}】刷新交接恢复状态已过期，自动清理")
+            if cookie_id in expired_manual:
+                logger.warning(
+                    f"【{cookie_id}】手动刷新保护期超过硬上限已失效，自动认证链路恢复接管"
+                )
+            else:
+                logger.warning(f"【{cookie_id}】刷新交接恢复状态已过期，自动清理")
 
 
     @classmethod
@@ -457,14 +471,34 @@ class XianyuAuthRecoveryMixin:
         return True
 
 
+    # 退避到期只代表"现在可以重试",不代表失败链中断。连续失败计数必须留到保留
+    # 窗口结束才丢弃:每次重试前都会走到 _get_active_password_login_failure_backoff,
+    # 它先把到期记录 pop 掉,于是 set_password_login_failure_backoff 每次看到的都是空
+    # 状态,consecutive_count 恒为 1——升级曲线（slider_punish 2x 到 4h 封顶）和
+    # "连续 N 次风控失败→自动暂停"保护双双失效（2026-11-15 review 确认线上从未
+    # 出现过 consecutive_failure_protected）。
+    _password_login_backoff_streak_retention_seconds = 6 * 3600
+
     @classmethod
     def _cleanup_password_login_failure_backoff(cls):
-        """清理已过期的密码登录失败退避状态"""
+        """清理「到期且超出计数保留窗口」的密码登录失败退避状态。
+
+        到期记录仍保留在表里:remaining_time <= 0 时等待逻辑自然放行,但 reason 与
+        consecutive_count 要留给下一次失败累加。只有成功恢复(显式 clear)或超过
+        保留窗口都没再失败,才真正清零。
+        """
         now = time.time()
+        retention = cls._password_login_backoff_streak_retention_seconds
+        try:
+            retention = int(RISK_CONTROL.get(
+                'password_login_backoff_streak_retention_seconds', retention) or retention)
+        except Exception:
+            pass
+        retention = max(0, retention)
         expired_cookie_ids = [
             cookie_id
             for cookie_id, state in cls._password_login_failure_backoff.items()
-            if now >= state.get('until', 0)
+            if now >= (state.get('until', 0) or 0) + retention
         ]
         for cookie_id in expired_cookie_ids:
             cls._password_login_failure_backoff.pop(cookie_id, None)
@@ -666,16 +700,20 @@ class XianyuAuthRecoveryMixin:
 
 
     def _should_skip_token_refresh_for_login_backoff(self, current_time: Optional[float] = None) -> bool:
-        """在需要人工介入或明确退避期间，直接跳过 token 预检，避免重复打到平台。"""
+        """在退避期间直接跳过 token 预检，避免重复打到平台。
+
+        只要退避还在生效,本轮真打平台必然拿到"令牌/Session过期",而密码登录又
+        因退避被挡住——结果就是每个重试周期都白打一次平台。此前只对
+        slider/verification/credentials/risk_control 这几类跳过,unknown 等其余
+        原因会漏出去,配合 10 秒级重试形成持续打平台的循环（2026-11-15 线上
+        191 次"原因: unknown"+每 ~10 秒一次真实 token 请求）。
+        """
         current_time = current_time or time.time()
         failure_backoff = self._get_active_password_login_failure_backoff(current_time)
         if not failure_backoff:
             return False
 
         backoff_reason = failure_backoff.get('reason', 'unknown')
-        if backoff_reason not in {'slider_failed', 'slider_punish', 'verification_required', 'credentials', 'risk_control'}:
-            return False
-
         remaining_time = failure_backoff.get('remaining_time', 0.0)
         should_log = (
             self.last_token_refresh_status != "password_login_backoff_wait" or
@@ -696,7 +734,13 @@ class XianyuAuthRecoveryMixin:
 
     @staticmethod
     def classify_password_login_failure(error_message: str) -> Tuple[str, int]:
-        """按失败类型返回(原因标签, 退避秒数)"""
+        """按失败类型返回(原因标签, 退避秒数)
+
+        分类结果决定两件事:退避时长,以及要不要跳过本轮的 token 预检。分类落到
+        unknown 会让这两件事同时失效——退避只有 300 秒、还照旧每轮真打一次平台。
+        所以登录链路真实产出的话术必须在这里有归属(2026-11-15 线上 191 次
+        "原因: unknown" 即为此)。
+        """
         message = (error_message or "").lower()
         if any(keyword in message for keyword in ["账号密码错误", "账密错误", "用户名或密码错误", "密码错误"]):
             return "credentials", 1800
@@ -710,6 +754,12 @@ class XianyuAuthRecoveryMixin:
                 "等待二维码验证超时",
                 "等待人脸验证超时",
                 "等待身份验证超时",
+                # slidex/本地滑块库实际产出的等待话术
+                "等待验证超时",
+                "扫码登录超时",
+                "验证超时",
+                "请重新发起验证",
+                "验证页面已超时",
             ]
         ):
             return "verification_required", 900
@@ -717,6 +767,24 @@ class XianyuAuthRecoveryMixin:
             return "risk_control", 900
         if any(keyword in message for keyword in ["滑块验证失败", "未找到滑块容器"]):
             return "slider_failed", 600
+        if any(keyword in message for keyword in ["密码登录超过", "已中止本次尝试并清理浏览器"]):
+            # 登录线程挂死(Chromium OOM / CDP 假死),整轮 600 秒白等:
+            # 退避要比普通失败更长,否则刚清理完就立刻重启浏览器再挂一次。
+            return "login_timeout", 600
+        if any(
+            keyword in message for keyword in [
+                "关键cookie仍未齐全",
+                "session仍未就绪",
+                "session未就绪",
+                "登录状态未确认",
+                "登录未成功",
+                "未获取到cookie",
+                "获取cookie失败",
+            ]
+        ):
+            # 登录表单提交过了但服务端会话没立起来(Cookie 缺字段):不是立刻能靠
+            # 重启浏览器解决的事,按中等退避,且本轮不再打平台。
+            return "login_not_confirmed", 300
         if any(
             keyword in message for keyword in [
                 "未找到登录表单",
@@ -1070,13 +1138,16 @@ class XianyuAuthRecoveryMixin:
             previous_cookie_refresh_enabled = live_instance.cookie_refresh_enabled
 
         cls._cleanup_manual_refresh_state()
+        # 硬 TTL:手动登录线程没有超时保护,挂死时 finally 不会执行。留出登录整体
+        # 截止时间 + 2 分钟余量,确保泄漏的状态能自愈而不是永久压制自动链路。
+        manual_refresh_expires_at = time.time() + float(_PASSWORD_LOGIN_DEADLINE_SECONDS) + 120
         with cls._manual_refresh_lock:
             existing = cls._manual_refresh_state.get(cookie_id)
             if existing:
                 existing["source"] = source
                 existing["phase"] = 'manual_refresh'
                 existing["updated_at"] = time.time()
-                existing["expires_at"] = None
+                existing["expires_at"] = manual_refresh_expires_at
                 return {
                     "started": False,
                     "already_active": True,
@@ -1088,7 +1159,7 @@ class XianyuAuthRecoveryMixin:
                 "phase": 'manual_refresh',
                 "started_at": time.time(),
                 "updated_at": time.time(),
-                "expires_at": None,
+                "expires_at": manual_refresh_expires_at,
                 "previous_cookie_refresh_enabled": previous_cookie_refresh_enabled,
             }
 
@@ -1259,7 +1330,13 @@ class XianyuAuthRecoveryMixin:
         logger.error(f"【{self.cookie_id}】{message}")
         self.last_token_refresh_status = 'failed'
         self.last_token_refresh_error_message = message
-        backoff_reason, backoff_seconds = self.classify_password_login_failure(message)
+        # 收口话术只说明"超时了",真实原因(卡在哪一步)在 slider.last_login_error 里:
+        # 用它分类,否则所有挂死都被压成同一个 login_timeout,退避与排查都失准。
+        try:
+            slider_reason = str(getattr(slider, 'last_login_error', '') or '').strip()
+        except Exception:
+            slider_reason = ''
+        backoff_reason, backoff_seconds = self.classify_password_login_failure(slider_reason or message)
         self.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
         logger.warning(f"【{self.cookie_id}】已进入失败退避期: {backoff_reason}, {backoff_seconds}秒")
         if refresh_risk_log_id:

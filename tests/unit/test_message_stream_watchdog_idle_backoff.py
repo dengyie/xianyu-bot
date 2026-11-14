@@ -36,6 +36,7 @@ class _FakePipeline(MessagePipelineMixin):
     def __init__(self, **overrides):
         self.cookie_id = 'test_cid'
         self.last_non_heartbeat_message_time = 0
+        self.last_stream_frame_time = 0
         self.last_sync_package_time = 0
         self.last_user_chat_time = 0
         self.stream_watchdog_trigger_times = deque(maxlen=8)
@@ -136,11 +137,28 @@ def test_frame_arrival_refreshes_timestamps_without_resetting_backoff():
         stream_watchdog_trigger_times=deque([1.0], maxlen=8),
     )
     p._mark_stream_frame_arrival(1200, is_sync_package=True)
-    assert p.last_non_heartbeat_message_time == 1200   # 展示/诊断时间戳刷新
+    assert p.last_stream_frame_time == 1200            # 链路活性(展示/诊断)
     assert p.last_sync_package_time == 1200
+    assert p.last_non_heartbeat_message_time == 0      # 业务活性不得被同步包刷新
     assert p.stream_watchdog_idle_streak == 3          # 退避保持不变
     assert p.stream_watchdog_pending_justify_deadline == 1000
     assert list(p.stream_watchdog_trigger_times) == [1.0]
+
+
+def test_sync_only_frames_still_allow_fake_online_detection():
+    """帧照收、业务包不来 = 半死连接,看门狗必须还能判出"假在线"。
+
+    回归 2026-11-15 review:逐帧热路径此前直接刷新
+    last_non_heartbeat_message_time,同步包源源不断就把 business_idle 压在阈值以下,
+    看门狗永不触发,而界面还报 healthy。
+    """
+    p = _FakePipeline(last_non_heartbeat_message_time=1_000_000)
+    for offset in range(0, 4000, 100):
+        p._mark_stream_frame_arrival(1_000_000 + offset, is_sync_package=True)
+
+    now = 1_000_000 + 3999
+    business_idle = now - (p.last_non_heartbeat_message_time or 0)
+    assert business_idle > DEFAULT_SETTINGS['timeout_seconds'], "只有同步包时业务空闲必须继续增长"
 
 
 def test_replayed_guidance_frames_do_not_hold_backoff_at_zero():

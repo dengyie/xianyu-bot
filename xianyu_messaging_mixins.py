@@ -938,12 +938,15 @@ class MessagePipelineMixin:
         """记录"收到任意非心跳帧",只刷新链路活性时间戳,不复位空闲退避。
 
         逐帧收包热路径(XianyuAutoAsync 每帧调用)会频繁收到同步包/引导重放/确认包,
-        它们只证明 WS 还在投递帧,不能证明业务链路健康。若在此复位退避,重连后 3~8 秒
-        必然到达的引导重放会立刻把退避清零(线上实测因此恒为 0 档、每 ~30 分钟无谓重连)。
-        真实业务事件请改用 _mark_non_heartbeat_message。
+        它们只证明 WS 还在投递帧,不能证明业务链路健康。
+
+        因此这里写 last_stream_frame_time(链路活性),**不写**
+        last_non_heartbeat_message_time(业务活性):后者是看门狗判定"假在线"的依据,
+        被同步包一起刷新的话,"帧照收、买家消息不来"的半死连接就永远不会被判出来
+        (2026-11-15 review)。真实业务事件请用 _mark_non_heartbeat_message。
         """
         now = received_at or time.time()
-        self.last_non_heartbeat_message_time = now
+        self.last_stream_frame_time = now
         if is_sync_package:
             self.last_sync_package_time = now
 
@@ -1087,6 +1090,10 @@ class MessagePipelineMixin:
                         sync_status = f"最近同步包距今{(now - self.last_sync_package_time):.0f}秒"
                     else:
                         sync_status = "当前连接尚未收到同步包"
+                    last_frame_at = getattr(self, 'last_stream_frame_time', 0) or 0
+                    if last_frame_at:
+                        # 帧还在来却没有业务包 = 半死连接;帧也停了 = 连接本身可能已死。
+                        sync_status += f"，最近任意帧距今{(now - last_frame_at):.0f}秒"
                     if self.last_user_chat_time:
                         user_chat_status = f"，最近真实买家消息距今{(now - self.last_user_chat_time):.0f}秒"
                     else:
@@ -2273,8 +2280,14 @@ class MessagePipelineMixin:
                             logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（未启用自动发货）")
                             return
                     # 如果不是简化结构，继续走正常流程
-            except Exception:
-                pass
+            except Exception as delivery_err:
+                # 兜底不能静默：买家已付款的订单若在这里抛错就再也不会自动发货，
+                # 而流程会继续往下走并打成「非聊天消息，处理结束」。此前是
+                # except: pass，线上完全没有痕迹可查（2026-11-15 review）。
+                logger.error(
+                    f"【{self.cookie_id}】[{msg_id}] 简化结构自动发货预处理异常，"
+                    f"本次未完成发货处理: {self._safe_str(delivery_err)}"
+                )
 
             # 判断是否为聊天消息
             if not self.is_chat_message(message):

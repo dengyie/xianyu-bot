@@ -502,7 +502,14 @@ class CookieMixin:
                     )
                     if not success:
                         # 如果更新失败，记录错误但不使用 save_cookie（避免覆盖账号密码）
+                        # update_cookie_account_info 内部吞掉异常只返回 False，所以下面
+                        # except 分支里的通知对写库失败永远不会触发。这里必须自己发：
+                        # 内存里的 Cookie 比库里新，重启后就会拿旧 Cookie 进鉴权死循环。
                         logger.warning(f"更新Cookie到数据库失败: {self.cookie_id}，但不使用save_cookie避免覆盖账号密码")
+                        await self.send_token_refresh_notification(
+                            f"数据库Cookie更新失败(写入返回False): {self.cookie_id}，重启后将复用旧Cookie",
+                            "db_update_failed",
+                        )
                     else:
                         # 常规成功路径:此前误用 WARNING 刷屏,降为 INFO(真失败仍在上分支 WARNING)
                         logger.info(f"已更新Cookie到数据库: {self.cookie_id}")

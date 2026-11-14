@@ -8,6 +8,7 @@ import os
 import random
 import secrets
 import threading
+import traceback
 from datetime import datetime
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
@@ -154,6 +155,15 @@ async def _start_playwright_safe(cookie_id: str = "default"):
 
 class InitAuthError(Exception):
     """WebSocket 已建立，但初始化鉴权失败。"""
+
+
+class InitAuthDeferred(Exception):
+    """主动让路：当前处于扫码登录稳定期，本轮不做 token 预检。
+
+    与 InitAuthError 分开是因为语义相反：这是设计内的等待，不是鉴权失败。
+    混用会让稳定期内每次让路都被记成 1/3 失败并按 ERROR 打印，三次账号任务
+    重启还能把 60 秒熔断打开——排查时最容易误判成真实故障（2026-11-15 线上）。
+    """
 
 
 class AutoReplyPauseManager:
@@ -485,6 +495,7 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
         """重置当前连接的消息流活性状态。"""
         now = connected_at or time.time()
         self.last_non_heartbeat_message_time = now
+        self.last_stream_frame_time = now
         self.last_sync_package_time = 0
         self.last_user_chat_time = 0
         self.last_heartbeat_response = 0
@@ -1024,6 +1035,7 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
         self.heartbeat_task = None
         self.ws = None
         self.last_non_heartbeat_message_time = 0
+        self.last_stream_frame_time = 0
         self.last_sync_package_time = 0
         self.last_user_chat_time = 0
         self.last_stream_watchdog_reconnect_time = 0
@@ -1308,8 +1320,29 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
         """创建并追踪后台任务，确保异常不会被静默忽略"""
         task = asyncio.create_task(coro)
         self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
+        task.add_done_callback(self._on_tracked_task_done)
         return task
+
+    def _on_tracked_task_done(self, task):
+        """取用并记录后台任务异常。
+
+        只 discard 不取 exception，异常要等任务对象被回收时才由 asyncio 打一句
+        没有账号上下文的 "never retrieved"——在按账号切分的日志里等于没打。
+        """
+        self.background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except Exception:
+            return
+        if exc is None:
+            return
+        try:
+            logger.error(f"【{self.cookie_id}】后台任务异常退出: {self._safe_str(exc)}")
+            logger.debug(f"【{self.cookie_id}】后台任务异常堆栈:\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
+        except Exception:
+            pass
 
     def _sanitize_buyer_nick(self, candidate: Any, *, source: str = "unknown",
                              message_meta: Dict[str, Any] = None, log_prefix: str = "") -> Optional[str]:
@@ -3205,7 +3238,7 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
         token_refresh_attempted = False
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
             if self._should_defer_auth_recovery_for_qr_grace():
-                raise InitAuthError(self.last_token_refresh_error_message or "扫码登录稳定期中，暂缓初始化Token预检")
+                raise InitAuthDeferred(self.last_token_refresh_error_message or "扫码登录稳定期中，暂缓初始化Token预检")
 
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
@@ -3472,6 +3505,40 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
         finally:
             # 确保任务能正常结束
             logger.info(f"【{self.cookie_id}】心跳循环已退出")
+
+    def _on_heartbeat_task_done(self, task):
+        """心跳任务退出的收口：异常退出必须强制重连。
+
+        heartbeat_loop 连续 3 次发送失败就 break，而看门狗在"心跳已经很久没回来"
+        时会直接 continue 跳过检查——两者叠加就是一条"连接还在、心跳已死、看门狗
+        不管"的死连接，只有一行 ERROR 日志，直到下次 WS 断开才自愈。
+        """
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except Exception:
+            exc = None
+        if exc is not None:
+            logger.error(f"【{self.cookie_id}】心跳任务异常退出: {self._safe_str(exc)}")
+        if self.heartbeat_task is not task:
+            # 已被重连/清理流程替换，交给新任务
+            return
+        _mgr = getattr(self, '_cookie_mgr', None)
+        if _mgr is not None:
+            try:
+                enabled = _mgr.get_cookie_status(self.cookie_id)
+            except Exception:
+                enabled = True
+            if not enabled:
+                # 账号被禁用是心跳循环的正常退出条件，重连只会变成空转
+                logger.info(f"【{self.cookie_id}】账号已禁用，心跳退出后不再重连")
+                return
+        if not self.ws or getattr(self.ws, 'closed', False):
+            # 主循环正在处理断开，不需要再补一刀
+            return
+        logger.warning(f"【{self.cookie_id}】心跳任务已退出且无人接管，强制重连以恢复心跳")
+        self._create_tracked_task(self._force_websocket_reconnect("心跳任务退出，恢复心跳"))
 
     async def handle_heartbeat_response(self, message_data):
         """处理心跳响应"""
@@ -4172,6 +4239,7 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
                             # 启动心跳任务（依赖WebSocket，每次重连都需要重启）
                             logger.info(f"【{self.cookie_id}】启动心跳任务...")
                             self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(websocket))
+                            self.heartbeat_task.add_done_callback(self._on_heartbeat_task_done)
 
                             # 启动其他后台任务（不依赖WebSocket，只在首次连接时启动）
                             tasks_started = []
@@ -4275,6 +4343,23 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
                             if self.ws == websocket:
                                 self.ws = None
                                 logger.info(f"【{self.cookie_id}】WebSocket连接已退出，引用已清理")
+
+                except InitAuthDeferred as e:
+                    # 扫码登录稳定期内主动让路：不计失败、不碰熔断、不打 ERROR。
+                    # 误记成初始化鉴权失败会让"安静等待"在监控里表现成故障，
+                    # 且每次账号任务重启都多加一次失败，凑够 3 次还会误开熔断。
+                    defer_reason = self._safe_str(e)
+                    self.current_token = None
+                    self.connection_failures = 0
+                    self.init_auth_failures = 0
+                    self._set_connection_state(ConnectionState.CONNECTING, "等待扫码登录稳定期结束")
+                    retry_delay = self._calculate_retry_delay(defer_reason)
+                    logger.info(
+                        f"【{self.cookie_id}】初始化暂缓（非失败）: {defer_reason}，{retry_delay} 秒后重试"
+                    )
+                    self._reset_background_tasks()
+                    await self._interruptible_sleep(retry_delay)
+                    continue
 
                 except InitAuthError as e:
                     error_msg = self._safe_str(e)

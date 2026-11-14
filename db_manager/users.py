@@ -100,7 +100,7 @@ class DBUsersMixin:
 
                 # 开始事务
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "BEGIN TRANSACTION")
+                self._begin_transaction(cursor)
 
                 if user_id is not None:
                     # 用户级导入：只清空该用户的数据
@@ -880,7 +880,7 @@ class DBUsersMixin:
                 cursor = self.conn.cursor()
 
                 # 开始事务
-                cursor.execute('BEGIN TRANSACTION')
+                self._begin_transaction(cursor)
 
                 # 删除用户相关的所有数据
                 # 1. 删除用户设置

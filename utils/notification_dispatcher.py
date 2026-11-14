@@ -27,6 +27,10 @@ SUPPORTED_NOTIFICATION_TEMPLATE_TYPES = (
     'cookie_refresh_success',
 )
 
+# 未配置通知渠道时的告警限频（按账号）
+_NO_CHANNEL_WARN_INTERVAL_SECONDS = 30 * 60
+_NO_CHANNEL_WARNED_AT: Dict[str, float] = {}
+
 
 DEFAULT_NOTIFICATION_TEMPLATES = {
     'message': '''🚨 接收消息通知
@@ -555,7 +559,15 @@ async def dispatch_account_notifications(account_id: str, message: str, *, title
         return False
 
     if not notifications:
-        logger.warning(f"【{account_id}】未配置消息通知，跳过发送")
+        # 没有配置任何渠道时每次通知都会走到这里；按账号限频，避免把真正重要的
+        # 告警从日志里冲掉（首次出现仍然给 warning，方便发现"通知没配"）。
+        now = time.time()
+        last_warned = _NO_CHANNEL_WARNED_AT.get(account_id, 0.0)
+        if now - last_warned >= _NO_CHANNEL_WARN_INTERVAL_SECONDS:
+            _NO_CHANNEL_WARNED_AT[account_id] = now
+            logger.warning(f"【{account_id}】未配置消息通知，跳过发送（同类提示每30分钟最多一次）")
+        else:
+            logger.debug(f"【{account_id}】未配置消息通知，跳过发送")
         return False
 
     return await dispatch_notifications(

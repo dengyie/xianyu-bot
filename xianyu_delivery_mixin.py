@@ -207,6 +207,41 @@ class DeliveryMixin:
             reason_text = '未提供发货日志原因'
 
         return f"{reason_text} [{', '.join(context_parts)}]"
+    def _get_finalized_delivery_unit_indexes(self, order_id: str):
+        """返回该订单已经完成（finalized）的发货单元序号集合。
+
+        读库失败时返回空集合（fail-open）：一次数据库抖动不能反过来拦住正常发货。
+        """
+        if not order_id:
+            return set()
+        try:
+            states = _db_package().get_delivery_finalization_states(order_id) or []
+        except Exception as e:
+            logger.warning(
+                f"【{self.cookie_id}】读取发货完成状态失败，按未发货处理: "
+                f"order_id={order_id}, error={self._safe_str(e)}"
+            )
+            return set()
+
+        finalized = set()
+        for state in states:
+            if not state or state.get('status') != 'finalized':
+                continue
+            try:
+                finalized.add(max(1, int(state.get('unit_index') or 1)))
+            except (TypeError, ValueError):
+                finalized.add(1)
+        return finalized
+
+    def _delivery_units_all_finalized(self, finalized_units, quantity_to_send) -> bool:
+        """本次应发的发货单元是否全部已完成。"""
+        try:
+            quantity = max(1, int(quantity_to_send or 1))
+        except (TypeError, ValueError):
+            quantity = 1
+        finalized = finalized_units or set()
+        return all(unit in finalized for unit in range(1, quantity + 1))
+
     def _get_pending_delivery_finalization_meta(self, order_id: str, delivery_unit_index: int = 1):
         if not order_id:
             return None
@@ -741,6 +776,37 @@ class DeliveryMixin:
                     else:
                         logger.info(f"无订单ID，发送单个卡券")
 
+                    if multi_quantity_delivery and order_id and quantity_to_send <= 1:
+                        # 订单详情里没有数量时用本地订单/已记录单元兜底，否则多数量订单
+                        # 只发 1 张卡、进度按 1/1 汇总成 shipped，买家永久少收且无告警。
+                        fallback_quantity = self._get_order_expected_delivery_quantity(order_id)
+                        if fallback_quantity > 1:
+                            quantity_to_send = fallback_quantity
+                            logger.warning(
+                                f"【{self.cookie_id}】订单 {order_id} 详情缺少数量信息，"
+                                f"按本地订单数量兜底: 将发送 {quantity_to_send} 个卡券"
+                            )
+
+                    # 防重复发货：已 finalized 的单元永不再发。
+                    # 「[记得及时发货]」这类提醒会在发货完成很久之后重复到达，而内存冷却
+                    # （10 分钟）和进程内集合在重启后都会失效，唯一可靠依据是库里的状态。
+                    finalized_units = self._get_finalized_delivery_unit_indexes(order_id)
+                    if self._delivery_units_all_finalized(finalized_units, quantity_to_send):
+                        logger.info(
+                            f"【{self.cookie_id}】订单 {order_id} 的 {quantity_to_send} 个发货单元均已完成，"
+                            f"忽略重复发货触发（已完成单元: {sorted(finalized_units)}）"
+                        )
+                        self._record_delivery_log(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=send_user_id,
+                            buyer_nick=send_user_name,
+                            status='success',
+                            reason='检测到订单已发货完成，跳过重复触发（防重复发货）',
+                            channel='auto'
+                        )
+                        return
+
                     successful_send_count = 0
                     last_delivery_error = None
                     prepared_units = []
@@ -749,6 +815,22 @@ class DeliveryMixin:
                         unit_index = i + 1
                         rule_meta = {}
                         try:
+                            if unit_index in finalized_units:
+                                logger.info(
+                                    f"【{self.cookie_id}】订单 {order_id} 第 {unit_index} 个发货单元已完成，"
+                                    f"跳过重复发货"
+                                )
+                                self._record_delivery_log(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=send_user_id,
+                                    buyer_nick=send_user_name,
+                                    status='success',
+                                    reason=f'第 {unit_index} 个发货单元已完成，跳过重复发货',
+                                    channel='auto'
+                                )
+                                continue
+
                             pending_finalize_meta = self._get_pending_delivery_finalization_meta(order_id, unit_index)
                             if pending_finalize_meta:
                                 finalize_result = await self._finalize_delivery_after_send(

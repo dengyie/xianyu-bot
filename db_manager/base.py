@@ -1871,9 +1871,15 @@ Cookie数量: {cookie_count}
                 existing_data = cursor.fetchall()
                 logger.info(f"备份 {count} 条通知渠道数据")
 
+            # 上一次升级若在 CREATE 与 RENAME 之间被打断（重启/OOM），临时表会
+            # 留在库里而 db_version 没有提升；下次启动重跑本步骤就会撞
+            # "table notification_channels_new already exists"，init_db 直接
+            # 抛错 → 永久启动崩溃循环。先清理残留再重建。
+            cursor.execute("DROP TABLE IF EXISTS notification_channels_new")
+
             # 创建新表，支持所有通知渠道类型
             cursor.execute('''
-            CREATE TABLE notification_channels_new (
+            CREATE TABLE IF NOT EXISTS notification_channels_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -2272,6 +2278,22 @@ Cookie数量: {cookie_count}
         """批量执行SQL并记录日志"""
         self._log_sql(sql, f"批量执行 {len(params_list)} 条记录", "EXECUTEMANY")
         return cursor.executemany(sql, params_list)
+    def _begin_transaction(self, cursor):
+        """开始批量写入的显式事务。
+
+        共享连接上任何一次写操作失败（例如 busy timeout）都可能留下未结束的
+        隐式事务：该写方法只 return False、没有 rollback，随后批量写入执行
+        BEGIN TRANSACTION 就会抛 "cannot start a transaction within a
+        transaction"，并被外层 except 吞掉——整批写入静默变成 0 条，商品标题/
+        价格同步就此停摆直到进程重启。这里先把残留事务回滚掉再开新事务。
+        """
+        try:
+            if getattr(self.conn, 'in_transaction', False):
+                logger.warning("检测到数据库连接存在残留事务，先回滚再开始批量写入")
+                self.conn.rollback()
+        except Exception as rollback_error:
+            logger.warning(f"回滚残留事务失败: {rollback_error}")
+        cursor.execute('BEGIN TRANSACTION')
     def execute_query(self, sql: str, params: tuple = None):
         """执行查询并返回结果"""
         with self.lock:

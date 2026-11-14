@@ -20,6 +20,26 @@ from utils.qr_login import qr_login_manager
 import cookie_manager
 import uuid
 
+def _password_login_account_not_owned(account_id: Any, user_id: Any) -> bool:
+    """账号已入库且归属其他用户时返回 True。
+
+    未入库的 account_id 属于"新增账号"，必须放行，否则首次登录新账号会被拦。
+    """
+    if not account_id:
+        return False
+    try:
+        existing_cookie = db_manager.db_manager.get_cookie_details(str(account_id))
+    except Exception as lookup_error:
+        logger.warning(f"校验账号归属时读取账号失败: {account_id}, error: {lookup_error}")
+        return False
+    if not existing_cookie:
+        return False
+    owner = existing_cookie.get('user_id')
+    if owner is None:
+        return False
+    return str(owner) != str(user_id)
+
+
 def create_account_login_router() -> APIRouter:
     router = APIRouter()
     @router.post("/manual-cookie-import")
@@ -157,6 +177,12 @@ def create_account_login_router() -> APIRouter:
             risk_log_id = None
 
             user_id = current_user['user_id']
+
+            # 非刷新模式同样要校验账号归属：account_id 是调用方自己传的，
+            # 拿别人的 cookie_id 走账密登录会覆盖对方账号并把 user_id 改绑到自己名下。
+            if _password_login_account_not_owned(account_id, user_id):
+                reply_server.log_with_user('warning', f"拒绝越权登录账号: {account_id}", current_user)
+                return {'success': False, 'message': '无权操作此账号'}
 
             # 刷新模式：从数据库读取已保存的账号密码
             if refresh_mode and account_id:

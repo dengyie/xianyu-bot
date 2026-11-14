@@ -799,8 +799,8 @@ class DBItemsMixin:
             with self.lock:
                 cursor = self.conn.cursor()
 
-                # 使用事务批量处理
-                cursor.execute('BEGIN TRANSACTION')
+                # 使用事务批量处理（先清理可能残留的未结束事务）
+                self._begin_transaction(cursor)
 
                 for item_data in items_data:
                     try:
@@ -883,8 +883,8 @@ class DBItemsMixin:
             with self.lock:
                 cursor = self.conn.cursor()
                 
-                # 使用事务批量处理
-                cursor.execute('BEGIN TRANSACTION')
+                # 使用事务批量处理（先清理可能残留的未结束事务）
+                self._begin_transaction(cursor)
                 
                 for item_data in items_data:
                     try:
@@ -976,7 +976,7 @@ class DBItemsMixin:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('BEGIN TRANSACTION')
+                self._begin_transaction(cursor)
 
                 for item_data in items_to_delete:
                     try:

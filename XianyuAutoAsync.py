@@ -3506,6 +3506,17 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
             # 确保任务能正常结束
             logger.info(f"【{self.cookie_id}】心跳循环已退出")
 
+    def _start_heartbeat_task(self, ws):
+        """启动心跳任务并挂上退出收口。
+
+        心跳有三个启动点（首次连接、Cookie 刷新前后各一次），各自 create_task 的话
+        很容易漏挂回调——漏了就等于那条连接的心跳异常无人接手。
+        """
+        task = asyncio.create_task(self.heartbeat_loop(ws))
+        self.heartbeat_task = task
+        task.add_done_callback(self._on_heartbeat_task_done)
+        return task
+
     def _on_heartbeat_task_done(self, task):
         """心跳任务退出的收口：异常退出必须强制重连。
 
@@ -4238,8 +4249,7 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
 
                             # 启动心跳任务（依赖WebSocket，每次重连都需要重启）
                             logger.info(f"【{self.cookie_id}】启动心跳任务...")
-                            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(websocket))
-                            self.heartbeat_task.add_done_callback(self._on_heartbeat_task_done)
+                            self._start_heartbeat_task(websocket)
 
                             # 启动其他后台任务（不依赖WebSocket，只在首次连接时启动）
                             tasks_started = []

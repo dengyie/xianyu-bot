@@ -192,3 +192,19 @@ async def test_heartbeat_task_exit_with_disabled_account_does_not_reconnect():
     host._on_heartbeat_task_done(task)
 
     assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_start_heartbeat_task_attaches_supervision_callback():
+    """三个心跳启动点(首次连接、Cookie 刷新前后)必须共用同一个带收口的入口。"""
+    host = _live_stub(ws=_ws(closed=True))
+
+    async def _fake_loop(ws):
+        return None
+
+    host.heartbeat_loop = _fake_loop
+    task = host._start_heartbeat_task(host.ws)
+
+    assert host.heartbeat_task is task
+    assert task._callbacks, "心跳任务必须挂上退出收口，否则异常退出无人接手"
+    await task

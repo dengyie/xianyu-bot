@@ -938,7 +938,7 @@ class CookieMixin:
                 # 重新启动心跳任务
                 if heartbeat_was_running and self.ws and not self.ws.closed:
                     logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+                    self._start_heartbeat_task(self.ws)
 
                 if success:
                     self.last_cookie_refresh_time = current_time
@@ -997,7 +997,7 @@ class CookieMixin:
                 if (self.ws and not self.ws.closed and
                     (not self.heartbeat_task or self.heartbeat_task.done())):
                     logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+                    self._start_heartbeat_task(self.ws)
 
                 if clear_message_received_flag:
                     # 仅在刷新链路确认恢复可用后，才清空消息接收标志。

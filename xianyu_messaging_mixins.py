@@ -2196,7 +2196,9 @@ class MessagePipelineMixin:
                             sid_lookup = self._lookup_delivery_order_by_sid(
                                 simple_sid,
                                 minutes=sid_lookup_minutes,
-                                log_prefix=log_prefix
+                                log_prefix=log_prefix,
+                                item_id=item_id,
+                                buyer_id=user_id,
                             )
                             sid_lookup = await self._refresh_sid_lookup_if_needed(
                                 simple_sid,

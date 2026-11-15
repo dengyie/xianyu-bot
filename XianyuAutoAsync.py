@@ -1444,7 +1444,9 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
         refreshed_lookup = self._lookup_delivery_order_by_sid(
             sid,
             minutes=minutes,
-            log_prefix=log_prefix
+            log_prefix=log_prefix,
+            item_id=item_id,
+            buyer_id=buyer_id,
         )
         refreshed_order = refreshed_lookup.get('order') or {}
 

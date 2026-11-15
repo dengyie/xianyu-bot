@@ -54,26 +54,84 @@ class OrderMixin:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】初始化订单状态处理器失败: {self._safe_str(e)}")
             self.order_status_handler = None
+    @staticmethod
+    def _normalize_sid_lookup_item_id(item_id: Any) -> str:
+        """sid 兜底查单用的商品ID；未知商品等占位值不参与过滤。"""
+        value = str(item_id or "").strip()
+        if not value or value in {"未知商品", "None", "null", "0"}:
+            return ""
+        return value
+
+    def _normalize_sid_lookup_buyer_id(self, buyer_id: Any) -> str:
+        """sid 兜底查单用的买家ID；空值/自己的ID/低可信值不参与过滤。"""
+        value = str(buyer_id or "").strip()
+        if not value:
+            return ""
+        myid = str(getattr(self, "myid", "") or "").strip()
+        if myid and value == myid:
+            return ""
+        try:
+            if not self._is_trustworthy_buyer_id(value):
+                return ""
+        except Exception:
+            return ""
+        return value
+
     def _lookup_delivery_order_by_sid(self, sid: str, *, minutes: int = 10,
-                                      log_prefix: str = "") -> Dict[str, Any]:
-        """根据 sid 查找简化发货对应订单，并区分是否已处理/已关闭。"""
+                                      log_prefix: str = "", item_id: Any = None,
+                                      buyer_id: Any = None) -> Dict[str, Any]:
+        """根据 sid 查找简化发货对应订单，并区分是否已处理/已关闭。
+
+        item_id / buyer_id 用来在取候选之前过滤：同一个 sid 下买家可能同时挂
+        着多笔待发货订单，不过滤就只能盲取最新一笔，调用方的商品一致性校验
+        再把它拒掉——结果是一笔真实订单被静默跳过（买家永远收不到货）。
+        过滤未命中时仍然回退到"仅按 sid"查询，行为不比改动前更差。
+        """
         normalized_sid = str(sid or "").strip()
         if not normalized_sid:
             return {"match_type": "missing", "order": None}
 
-        try:
-            pending_orders = _db_host().find_recent_orders_by_match_context(
+        lookup_item_id = self._normalize_sid_lookup_item_id(item_id)
+        lookup_buyer_id = self._normalize_sid_lookup_buyer_id(buyer_id)
+
+        def query(statuses):
+            filters = {}
+            if lookup_item_id:
+                filters["item_id"] = lookup_item_id
+            if lookup_buyer_id:
+                filters["buyer_id"] = lookup_buyer_id
+
+            if filters:
+                rows = _db_host().find_recent_orders_by_match_context(
+                    sid=normalized_sid,
+                    cookie_id=self.cookie_id,
+                    statuses=statuses,
+                    minutes=minutes,
+                    limit=5,
+                    **filters,
+                )
+                if rows:
+                    return rows
+                logger.info(
+                    f"{log_prefix} sid兜底按商品/买家过滤未命中，回退为仅按 sid 查询: "
+                    f"sid={normalized_sid}, item_id={lookup_item_id or '-'}, buyer_id={lookup_buyer_id or '-'}"
+                )
+
+            return _db_host().find_recent_orders_by_match_context(
                 sid=normalized_sid,
                 cookie_id=self.cookie_id,
-                statuses=[
-                    "pending_ship",
-                    "pending_delivery",
-                    "partial_success",
-                    "partial_pending_finalize",
-                ],
+                statuses=statuses,
                 minutes=minutes,
                 limit=5,
             )
+
+        try:
+            pending_orders = query([
+                "pending_ship",
+                "pending_delivery",
+                "partial_success",
+                "partial_pending_finalize",
+            ])
         except Exception as lookup_error:
             logger.error(f"{log_prefix} sid兜底查单异常: {self._safe_str(lookup_error)}")
             return {"match_type": "error", "order": None}
@@ -87,19 +145,13 @@ class OrderMixin:
             return {"match_type": "pending_ship", "order": order}
 
         try:
-            recent_orders = _db_host().find_recent_orders_by_match_context(
-                sid=normalized_sid,
-                cookie_id=self.cookie_id,
-                statuses=[
-                    "processing",
-                    "pending_payment",
-                    "shipped",
-                    "completed",
-                    "cancelled",
-                ],
-                minutes=minutes,
-                limit=5,
-            )
+            recent_orders = query([
+                "processing",
+                "pending_payment",
+                "shipped",
+                "completed",
+                "cancelled",
+            ])
         except Exception as lookup_error:
             logger.error(f"{log_prefix} sid兜底查单异常: {self._safe_str(lookup_error)}")
             return {"match_type": "error", "order": None}

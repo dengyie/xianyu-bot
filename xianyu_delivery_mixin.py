@@ -507,7 +507,9 @@ class DeliveryMixin:
                         sid_lookup = self._lookup_delivery_order_by_sid(
                             fallback_sid,
                             minutes=sid_lookup_minutes,
-                            log_prefix=log_prefix
+                            log_prefix=log_prefix,
+                            item_id=item_id,
+                            buyer_id=send_user_id,
                         )
                         sid_lookup = await self._refresh_sid_lookup_if_needed(
                             fallback_sid,

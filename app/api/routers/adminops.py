@@ -2226,7 +2226,10 @@ def create_admin_ops_router() -> APIRouter:
             file_info = db_manager.db_manager.get_file(file_id)
             if not file_info:
                 raise HTTPException(status_code=404, detail="文件不存在")
-            db_manager.db_manager.record_download(file_id, user_id)
+            consumed, _remaining = db_manager.db_manager.consume_download_quota(file_id, user_id)
+            if not consumed:
+                reply_server.track(user=current_user.get("username","?"), action=ActionEvent.FILE_DOWNLOAD, target=str(file_id), result="quota_exceeded", detail="max={}".format(max_allowed))
+                raise HTTPException(status_code=403, detail="下载次数已用完")
             reply_server.track(user=str(user_id), action=ActionEvent.FILE_DOWNLOAD, target="{}:{}".format(file_id, file_info.get("filename","?")), detail="via=token")
             return Response(
                 content=file_info['file_data'],
@@ -2307,10 +2310,14 @@ def create_admin_ops_router() -> APIRouter:
                 reply_server.track(user=current_user.get("username","?"), action=ActionEvent.FILE_DOWNLOAD, target=str(file_id), result="quota_exceeded", detail="max={}".format(max_allowed))
                 raise HTTPException(status_code=403, detail="下载次数已用完")
             token_str = secrets.token_urlsafe(32)
+            now = time.time()
+            # 顺手清理过期 token，避免「只签发不消费」让字典无限增长
+            for stale in [t for t, d in state.DOWNLOAD_TOKENS.items() if d.get("exp", 0) <= now]:
+                state.DOWNLOAD_TOKENS.pop(stale, None)
             state.DOWNLOAD_TOKENS[token_str] = {
                 "user_id": user_id,
                 "file_id": file_id,
-                "exp": time.time() + 120
+                "exp": now + 120
             }
             return {"success": True, "token": token_str}
         except HTTPException:
@@ -2333,7 +2340,12 @@ def create_admin_ops_router() -> APIRouter:
             file_info = db_manager.db_manager.get_file(file_id)
             if not file_info:
                 raise HTTPException(status_code=404, detail="文件不存在")
-            db_manager.db_manager.record_download(file_id, user_id)
+            # 额度必须在真正出文件时原子占用：token 可以在签发后积攒多张，
+            # 只在签发时校验会被「多签发→逐个消费」绕过上限。
+            consumed, _remaining = db_manager.db_manager.consume_download_quota(file_id, user_id)
+            if not consumed:
+                reply_server.track(user=str(user_id), action=ActionEvent.FILE_DOWNLOAD, target=str(file_id), result="quota_exceeded", detail="via=token")
+                raise HTTPException(status_code=403, detail="下载次数已用完")
             reply_server.track(user=str(user_id), action=ActionEvent.FILE_DOWNLOAD, target="{}:{}".format(file_id, file_info.get("filename","?")), detail="via=token")
             return Response(
                 content=file_info['file_data'],

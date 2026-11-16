@@ -74,3 +74,19 @@ def test_direct_download_consumes_user_quota(client, auth):
 
     assert first.status_code == 200
     assert second_token.status_code == 403
+
+
+def test_prefetched_tokens_cannot_exceed_quota(client, auth):
+    """签发 token 不占额度，必须在消费时原子校验，否则多签发即可绕过上限。"""
+    file_id = _upload_file(client, auth, body=b"bypass", max_downloads="1")
+    first_token = _issue_token(client, auth, file_id)
+    second_token = _issue_token(client, auth, file_id)
+
+    first = client.get(f"/api/files/{file_id}/direct?token={first_token}")
+    second = client.get(f"/api/files/{file_id}/direct?token={second_token}")
+
+    assert first.status_code == 200
+    assert first.content == b"bypass"
+    assert second.status_code == 403
+    assert second.content != b"bypass"
+

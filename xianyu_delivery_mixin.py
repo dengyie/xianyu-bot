@@ -267,7 +267,9 @@ class DeliveryMixin:
         except Exception:
             return 0
         websocket = getattr(self, 'ws', None)
-        if websocket is None:
+        # ws 引用在 finally 里会清空，但重连窗口内仍可能拿到「已关闭但非 None」的
+        # 旧连接；此时补发必然失败，却会白白消耗 3 次重试额度，必须先挡掉。
+        if websocket is None or getattr(websocket, 'closed', False):
             return 0
 
         try:
@@ -313,6 +315,17 @@ class DeliveryMixin:
             if self._delivery_units_all_finalized(finalized_units, expected_quantity):
                 attempts.pop(order_id, None)
                 continue
+
+            # 冷却期 / 延迟锁 / 正在处理的订单属于正常节奏，不是「补发失败」。
+            # 若直接交给 handler，它会在闸门处提前返回，却已消耗掉一次重试额度，
+            # 让真正需要的补发少一次机会；这里跳过且不计数，下个周期再看。
+            try:
+                if getattr(self, 'is_lock_held', lambda _k: False)(order_id):
+                    continue
+                if not self.can_auto_delivery(order_id):
+                    continue
+            except Exception:
+                pass
 
             history['count'] = int(history.get('count') or 0) + 1
             history['last_ts'] = now

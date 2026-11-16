@@ -3736,7 +3736,32 @@ class SendMixin:
 
             try:
                 await self.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
+            except Exception as send_error:
+                # 这一步失败=卡券没有发出去（或只发了一半），退回 failed 允许重发是正确的。
+                self._release_data_reservation_if_needed(delivery_meta, error=self._safe_str(send_error))
+                self._persist_delivery_finalization_state(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    delivery_meta=delivery_meta,
+                    channel='auto',
+                    status='failed',
+                    last_error=self._safe_str(send_error),
+                )
+                self._record_delivery_log(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    status='failed',
+                    reason=f'{source} 自动发货消息发送失败: {self._safe_str(send_error)}',
+                    channel='auto',
+                    rule_meta=delivery_meta,
+                )
+                return False
 
+            # 卡券已真实发出。此后任何异常都必须记为 sent（等待补确认），绝不能退回
+            # failed —— failed 会被视为「未发送」，下一次重试会把同一张卡再发一遍。
+            try:
                 if not self._mark_data_reservation_sent_if_needed(delivery_meta):
                     self._release_data_reservation_if_needed(delivery_meta, error='补偿发货发送成功后标记预占已发送失败')
                     raise Exception('批量数据预占标记已发送失败')
@@ -3812,25 +3837,31 @@ class SendMixin:
                 )
                 logger.warning(f"【{self.cookie_id}】{source} 已完成补偿自动发货: order_id={order_id}")
                 return True
-            except Exception as send_error:
-                self._release_data_reservation_if_needed(delivery_meta, error=self._safe_str(send_error))
+            except Exception as post_send_error:
+                # 走到这里说明卡券消息已经发出，只是后续（预占标记/消费/确认发货）
+                # 出错。必须记 sent 而不是 failed：failed 会被当作未发送，
+                # 下一轮补偿会把同一张卡再发一遍（重复发货比漏确认严重得多）。
                 self._persist_delivery_finalization_state(
                     order_id=order_id,
                     item_id=item_id,
                     buyer_id=buyer_id,
                     delivery_meta=delivery_meta,
                     channel='auto',
-                    status='failed',
-                    last_error=self._safe_str(send_error),
+                    status='sent',
+                    last_error=self._safe_str(post_send_error),
                 )
                 self._record_delivery_log(
                     order_id=order_id,
                     item_id=item_id,
                     buyer_id=buyer_id,
                     status='failed',
-                    reason=f'{source} 自动发货消息发送失败: {self._safe_str(send_error)}',
+                    reason=f'{source} 卡券已发出但收尾失败: {self._safe_str(post_send_error)}',
                     channel='auto',
                     rule_meta=delivery_meta,
+                )
+                logger.error(
+                    f"【{self.cookie_id}】{source} 订单 {order_id} 卡券已发出但收尾失败，"
+                    f"已记为待补确认（不会重发）: {self._safe_str(post_send_error)}"
                 )
                 return False
     async def get_default_reply(self, send_user_name: str, send_user_id: str, send_message: str, chat_id: str, item_id: str = None) -> str:

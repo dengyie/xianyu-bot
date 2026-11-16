@@ -2278,6 +2278,44 @@ Cookie数量: {cookie_count}
             logger.error("check_download_quota failed: {}".format(e))
             return (False, 0, 0)
 
+    def consume_download_quota(self, file_id, user_id):
+        """原子地「校验并占用」一次下载额度，返回 (是否成功, 剩余次数)。
+
+        下载是两步流程（先签发一次性 token、后消费），如果只在签发时校验，
+        用户可以连续签发 N 个 token 再逐个消费，轻松突破 max_downloads_per_user。
+        这里在同一把锁内完成「读上限 → 读已用 → 自增」，把额度判定放到真正
+        出文件的那一刻。
+        """
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                self._ensure_file_tables(cursor)
+                cursor.execute('SELECT max_downloads_per_user FROM download_files WHERE id = ?', (file_id,))
+                file_row = cursor.fetchone()
+                if not file_row:
+                    return (False, 0)
+                max_allowed = file_row[0] if file_row[0] is not None else 0
+                cursor.execute(
+                    'SELECT download_count FROM download_records WHERE file_id = ? AND user_id = ?',
+                    (file_id, user_id),
+                )
+                record_row = cursor.fetchone()
+                current_count = record_row[0] if record_row else 0
+                if current_count >= max_allowed:
+                    return (False, 0)
+                cursor.execute('''
+                    INSERT INTO download_records (file_id, user_id, download_count, last_download_at)
+                    VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(file_id, user_id) DO UPDATE SET
+                        download_count = download_count + 1,
+                        last_download_at = CURRENT_TIMESTAMP
+                ''', (file_id, user_id))
+                self.conn.commit()
+                return (True, max_allowed - current_count - 1)
+        except Exception as e:
+            logger.error("consume_download_quota failed: {}".format(e))
+            return (False, 0)
+
     def record_download(self, file_id, user_id):
         try:
             with self.lock:

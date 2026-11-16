@@ -8,9 +8,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 import time
+from collections import defaultdict
 from unittest import mock
 
 import pytest
@@ -19,6 +21,7 @@ import xianyu_auth_recovery
 import xianyu_delivery_mixin
 from db_manager.orders import DBOrdersMixin
 from xianyu_delivery_mixin import DeliveryMixin
+from xianyu_messaging_mixins import SendMixin
 
 
 # --------------------------------------------------------------------------
@@ -109,9 +112,12 @@ def test_stuck_order_query_honors_limit_and_sorts_oldest_first():
 class _SweepHost(DeliveryMixin):
     cookie_id = 'sweep-ck'
     _safe_str = staticmethod(lambda e: str(e))
+    delivery_cooldown = 600
+    last_delivery_time = {}
 
     def __init__(self, orders, *, ws=True, auto_confirm=True,
-                 expected_quantity=2, finalized_units=None):
+                 expected_quantity=2, finalized_units=None,
+                 locked_orders=(), cooling_orders=()):
         self._orders = orders
         self.ws = object() if ws is True else ws
         self._auto_confirm = auto_confirm
@@ -119,6 +125,13 @@ class _SweepHost(DeliveryMixin):
         self._finalized_units = set(finalized_units or [])
         self._handle_auto_delivery = mock.AsyncMock()
         self._delivery_retry_attempts = {}
+        self._locked_orders = set(locked_orders)
+        self.last_delivery_time = {
+            oid: time.time() for oid in cooling_orders
+        }
+
+    def is_lock_held(self, order_id):
+        return order_id in self._locked_orders
 
     def is_auto_confirm_enabled(self):
         return self._auto_confirm
@@ -159,6 +172,22 @@ async def test_sweep_requires_websocket_and_auto_confirm(monkeypatch):
     disabled = _SweepHost([], auto_confirm=False)
     assert await disabled._sweep_stuck_delivery_orders() == 0
     fake.get_stuck_delivery_orders.assert_not_called()
+
+
+class _ClosedWs:
+    closed = True
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_closed_websocket_without_burning_attempts(monkeypatch):
+    fake = _patch_db(monkeypatch, [_row()])
+    host = _SweepHost([], ws=_ClosedWs(), expected_quantity=2, finalized_units={1})
+
+    assert await host._sweep_stuck_delivery_orders() == 0
+    # 已关闭的连接不能再被当作可发送通道：既不查库也不消耗重试额度
+    fake.get_stuck_delivery_orders.assert_not_called()
+    assert host._delivery_retry_attempts == {}
+    host._handle_auto_delivery.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -204,6 +233,27 @@ async def test_sweep_caps_attempts_and_spaces_retries(monkeypatch):
 
     assert await host._sweep_stuck_delivery_orders() == 0
     host._handle_auto_delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_burn_attempts_on_lock_or_cooldown(monkeypatch):
+    """冷却/延迟锁是正常节奏，不该消耗补发额度（否则真实补发会少一次机会）。"""
+    _patch_db(monkeypatch, [
+        _row(order_id='locked'),
+        _row(order_id='cooling'),
+        _row(order_id='ready'),
+    ])
+    host = _SweepHost(
+        [], expected_quantity=2, finalized_units={1},
+        locked_orders={'locked'}, cooling_orders={'cooling'},
+    )
+
+    assert await host._sweep_stuck_delivery_orders() == 1
+    assert 'locked' not in host._delivery_retry_attempts
+    assert 'cooling' not in host._delivery_retry_attempts
+    assert host._delivery_retry_attempts['ready']['count'] == 1
+    args, kwargs = host._handle_auto_delivery.await_args
+    assert kwargs['order_id'] == 'ready'
 
 
 @pytest.mark.asyncio
@@ -288,3 +338,129 @@ def test_terminal_confirm_completes_unit():
     assert host.logged['status'] == 'success'
     assert host.logged['buyer_nick'] == '买家昵称'
     assert '平台订单已处于终态' in host.logged['reason']
+
+
+# --------------------------------------------------------------------------
+# 无会话补偿发货：发送失败 vs 发送后失败 的状态落盘口径
+# --------------------------------------------------------------------------
+class _RecoveredHost(SendMixin):
+    """只装配 `_send_recovered_delivery_without_sid` 需要的最小依赖。"""
+
+    cookie_id = 'recovered-ck'
+    _safe_str = staticmethod(lambda e: str(e))
+
+    def __init__(self, *, send_error=None, finalize_error=None):
+        self._order_locks = defaultdict(asyncio.Lock)
+        self._lock_usage_times = {}
+        self._send_error = send_error
+        self._finalize_error = finalize_error
+        self.sent = []
+        self.persisted = []
+        self.logs = []
+        self.released = []
+
+    def can_auto_delivery(self, order_id):
+        return True
+
+    def is_lock_held(self, order_id):
+        return False
+
+    def _get_pending_delivery_finalization_meta(self, order_id, unit_index=1):
+        return None
+
+    async def _auto_delivery(self, item_id, item_title=None, order_id=None,
+                             send_user_id=None, chat_id=None, include_meta=False, **_kwargs):
+        return {
+            'success': True,
+            'content': 'RECOVERED-CARD',
+            'delivery_steps': ['RECOVERED-CARD'],
+            'rule_id': 1,
+            'card_type': 'text',
+            'delivery_unit_index': 1,
+        }
+
+    def _build_delivery_steps(self, content, description=''):
+        return [content]
+
+    async def send_delivery_steps_once(self, buyer_id, item_id, delivery_steps):
+        if self._send_error:
+            raise RuntimeError(self._send_error)
+        self.sent.append((buyer_id, item_id, list(delivery_steps)))
+
+    def _mark_data_reservation_sent_if_needed(self, delivery_meta):
+        return True
+
+    def _release_data_reservation_if_needed(self, delivery_meta, error=None):
+        self.released.append({'error': error})
+        return True
+
+    def _persist_delivery_finalization_state(self, *, order_id, item_id, buyer_id,
+                                             delivery_meta, channel, status,
+                                             last_error=None):
+        self.persisted.append({'status': status, 'last_error': last_error})
+        return True
+
+    async def _finalize_delivery_after_send(self, delivery_meta=None, order_id=None, item_id=None):
+        if self._finalize_error:
+            raise RuntimeError(self._finalize_error)
+        return {'success': True}
+
+    def _sync_order_delivery_progress(self, **kwargs):
+        return {'aggregate_status': 'shipped'}
+
+    def _activate_delivery_lock(self, lock_key, delay_minutes=10):
+        return None
+
+    def _record_delivery_log(self, **kwargs):
+        self.logs.append(kwargs)
+
+    async def _run(self, order_id):
+        return await self._send_recovered_delivery_without_sid(
+            {'quantity': 1},
+            order_id=order_id,
+            item_id='item-1',
+            buyer_id='buyer-1',
+            source='测试补偿',
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovered_delivery_post_send_failure_records_sent_not_failed():
+    """卡券已发出后的收尾异常必须记 sent——记 failed 会让重试重发同一张卡。"""
+    host = _RecoveredHost(finalize_error='auto_confirm blew up')
+
+    ok = await host._run('order-post-send')
+
+    assert ok is False
+    assert host.sent, '卡券应当已经发出'
+    statuses = [p['status'] for p in host.persisted]
+    assert 'failed' not in statuses, f'发送后失败不能落 failed: {statuses}'
+    assert host.persisted[-1]['status'] == 'sent'
+    assert host.persisted[-1]['last_error'] == 'auto_confirm blew up'
+    assert host.released == [], '卡券已发出，不应释放数据预占'
+
+
+@pytest.mark.asyncio
+async def test_recovered_delivery_send_failure_records_failed():
+    """发送本身失败时卡券没出去，必须记 failed 以便重试补发。"""
+    host = _RecoveredHost(send_error='websocket closed')
+
+    ok = await host._run('order-send-fail')
+
+    assert ok is False
+    assert host.sent == []
+    assert host.persisted[-1]['status'] == 'failed'
+    assert host.persisted[-1]['last_error'] == 'websocket closed'
+    assert len(host.released) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_delivery_success_records_finalized():
+    host = _RecoveredHost()
+
+    ok = await host._run('order-ok')
+
+    assert ok is True
+    assert host.sent
+    assert host.persisted[-1]['status'] == 'finalized'
+    assert host.logs[-1]['status'] == 'success'

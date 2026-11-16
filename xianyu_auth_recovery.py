@@ -47,7 +47,61 @@ db_manager = _HostDBManagerProxy()
 
 # 密码登录（含滑块求解）整体时限。合法流程含浏览器冷启动与多次滑块重试，
 # 通常 2~4 分钟；超过该上限即视为 Chromium 假死/OOM，收口为失败并重试。
-_PASSWORD_LOGIN_DEADLINE_SECONDS = float(os.environ.get('PASSWORD_LOGIN_DEADLINE_SECONDS', '600') or '600')
+#
+# 但它必须严格大于「内层人工验证等待 + 登录步骤预算」：内层（slidex
+# _wait_for_context_login）默认要等 450s 扫码，如果外层还是 600s，扣掉冷启动
+# 与滑块后就只剩不到 150s，于是外层总在平台等扫码的中途把 Chromium 杀掉。
+# 后果是连锁的：页面当场 closed → 之后每次截图都 `Target page, context or
+# browser has been closed` → 用户想扫时二维码早已失效 → 失败原因也只能退化成
+# login_timeout（真实原因被抹平）。2026-11-16 线上多轮实证。
+_LOGIN_STEP_BUDGET_SECONDS = 300  # 冷启动 + 账密提交 + 滑块/惩罚重试
+_DEFAULT_VERIFICATION_WAIT_SECONDS = 450  # 与 slidex XY_VERIFICATION_WAIT_TIMEOUT 默认值对齐
+
+
+def _resolve_verification_wait_seconds() -> float:
+    """内层人工验证等待时长（秒），与 slidex 读同一个 env，保证两侧不漂移。"""
+    raw = os.environ.get('XY_VERIFICATION_WAIT_TIMEOUT')
+    if raw is None or str(raw).strip() == '':
+        return float(_DEFAULT_VERIFICATION_WAIT_SECONDS)
+    try:
+        return float(max(5, int(str(raw).strip())))
+    except (TypeError, ValueError):
+        return float(_DEFAULT_VERIFICATION_WAIT_SECONDS)
+
+
+def _resolve_password_login_deadline_seconds() -> float:
+    """密码登录整体时限：默认 = 内层验证等待 + 步骤预算，显式 env 优先。"""
+    raw = os.environ.get('PASSWORD_LOGIN_DEADLINE_SECONDS')
+    if raw is not None and str(raw).strip() != '':
+        try:
+            return max(60.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    return float(_resolve_verification_wait_seconds() + _LOGIN_STEP_BUDGET_SECONDS)
+
+
+_PASSWORD_LOGIN_DEADLINE_SECONDS = _resolve_password_login_deadline_seconds()
+
+
+# 面板可见的「需要人工扫码登录」状态文案。
+# 扫码只能由人完成，而通知渠道未配置时 send_token_refresh_notification 是空操作；
+# 2026-11-16 线上就因为只写内存状态，每轮 450s 等扫码却无人知晓，静默了数小时。
+_QR_LOGIN_REQUIRED_NOTE = '待扫码登录（需人工）'
+_QR_LOGIN_REQUIRED_MARKERS = (
+    '扫码',
+    'mini_login',
+    '等待验证超时',
+    'verification_required',
+    'verification_pending_manual',
+)
+
+
+def _is_qr_login_required_message(message: str) -> bool:
+    """失败信息是否指向「平台要求扫码登录」（而非滑块/风控/网络抖动）。"""
+    text = str(message or '')
+    if not text:
+        return False
+    return any(marker in text for marker in _QR_LOGIN_REQUIRED_MARKERS)
 
 
 _CHROMIUM_PROCESS_NAMES = {"chromium", "chrome", "chromium-browser", "google-chrome"}
@@ -901,6 +955,30 @@ class XianyuAuthRecoveryMixin:
             return False
         return True
 
+    def _mark_qr_login_required(self, message: str = '') -> None:
+        """把「平台要求扫码登录」落成面板可见状态。
+
+        扫码只能由人完成。此前的处理只写了内存里的 last_token_refresh_status，
+        通知渠道又常常没配（send_token_refresh_notification 变成空操作），
+        于是每一轮 450s 等扫码都没人知道，线上静默了数小时（2026-11-16 事故）。
+        status_note 非空时面板会渲染「需人工处理」告警（带远程桌面入口），
+        恢复后由 _clear_account_pause_state / _finalize_token_success 清除。
+        """
+        self._qr_login_required = True
+        self._qr_login_required_message = str(message or '').strip()
+        try:
+            db_manager.update_cookie_status_note(self.cookie_id, _QR_LOGIN_REQUIRED_NOTE)
+        except Exception as note_e:  # noqa: BLE001 面板标记失败不应影响登录收口
+            logger.warning(f"【{self.cookie_id}】写入待扫码登录状态文案失败: {self._safe_str(note_e)}")
+
+    def _clear_qr_login_required(self) -> None:
+        """清除「待扫码登录」标记（仅在恢复成功后调用，避免陈旧告警长期挂在面板）。"""
+        self._qr_login_required = False
+        self._qr_login_required_message = ''
+        try:
+            db_manager.clear_cookie_status_note_if_equals(self.cookie_id, _QR_LOGIN_REQUIRED_NOTE)
+        except Exception as clear_e:  # noqa: BLE001
+            logger.debug(f"【{self.cookie_id}】清除待扫码登录状态文案失败: {self._safe_str(clear_e)}")
 
     async def _apply_account_pause_state(
         self,
@@ -1031,8 +1109,10 @@ class XianyuAuthRecoveryMixin:
 
         if not pause_account:
             if verification_type == 'login_page':
+                self._mark_qr_login_required(message)
                 logger.warning(
-                    f"【{self.cookie_id}】检测到普通扫码登录入口({verification_context})，仅通知用户完成登录，不自动暂停账号"
+                    f"【{self.cookie_id}】检测到普通扫码登录入口({verification_context})，"
+                    f"仅通知用户完成登录，不自动暂停账号；已在面板标记「{_QR_LOGIN_REQUIRED_NOTE}」"
                 )
             else:
                 logger.warning(
@@ -1401,7 +1481,6 @@ class XianyuAuthRecoveryMixin:
             f"已中止本次尝试并清理浏览器（{kill_note}）"
         )
         logger.error(f"【{self.cookie_id}】{message}")
-        self.last_token_refresh_status = 'failed'
         self.last_token_refresh_error_message = message
         # 收口话术只说明"超时了",真实原因(卡在哪一步)在 slider.last_login_error 里:
         # 用它分类,否则所有挂死都被压成同一个 login_timeout,退避与排查都失准。
@@ -1409,6 +1488,16 @@ class XianyuAuthRecoveryMixin:
             slider_reason = str(getattr(slider, 'last_login_error', '') or '').strip()
         except Exception:
             slider_reason = ''
+        qr_login_required = bool(getattr(self, '_qr_login_required', False)) or _is_qr_login_required_message(
+            slider_reason or message
+        )
+        if qr_login_required:
+            # 扫码只能人工完成：状态留在 verification_pending_manual，面板才会
+            # 持续渲染「需人工处理」告警。写成 failed 会让告警消失，用户彻底失去线索。
+            self.last_token_refresh_status = 'verification_pending_manual'
+            self._mark_qr_login_required(getattr(self, '_qr_login_required_message', '') or slider_reason or message)
+        else:
+            self.last_token_refresh_status = 'failed'
         backoff_reason, backoff_seconds = self.classify_password_login_failure(slider_reason or message)
         self.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
         logger.warning(f"【{self.cookie_id}】已进入失败退避期: {backoff_reason}, {backoff_seconds}秒")
@@ -1739,7 +1828,12 @@ class XianyuAuthRecoveryMixin:
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
             logger.info(f"【{self.cookie_id}】使用账号: {username}")
-            
+
+            # 每轮开始先清「本轮是否卡在扫码登录」标记：否则上一轮残留会让本轮
+            # 任何超时都被误判成扫码问题（宁可少判，不可错判）。
+            self._qr_login_required = False
+            self._qr_login_required_message = ''
+
             # 创建一个通知回调包装函数，支持接收截图路径和验证链接
             async def notification_callback_wrapper(
                 message: str,
@@ -1752,6 +1846,10 @@ class XianyuAuthRecoveryMixin:
                 should_pause_account = self._should_pause_for_manual_verification(verification_type, verification_context)
                 self.last_token_refresh_status = 'verification_pending_manual' if not should_pause_account else 'manual_verification_required'
                 self.last_token_refresh_error_message = str(message or '').strip()
+                if verification_type == 'login_page':
+                    # 平台把账密登录打回扫码页：只能人工扫，先落可见状态再等。
+                    self._qr_login_required = True
+                    self._qr_login_required_message = str(message or '').strip()
                 pause_target_loop = None
                 _mgr = self._cookie_mgr
                 pause_target_loop = getattr(_mgr, 'loop', None)
@@ -1933,6 +2031,14 @@ class XianyuAuthRecoveryMixin:
             else:
                 login_error = getattr(slider, 'last_login_error', '') or "密码登录失败，未获取到Cookie"
                 self.last_token_refresh_error_message = login_error
+                # 内层验证超时会正常返回（不走外层 TimeoutError 那条收口），
+                # 这里同样要把「待扫码登录」留住，否则状态会被后续流程覆盖成
+                # 普通失败，面板告警随之消失（2026-11-16 线上实证）。
+                if getattr(self, '_qr_login_required', False) or _is_qr_login_required_message(login_error):
+                    self.last_token_refresh_status = 'verification_pending_manual'
+                    self._mark_qr_login_required(
+                        getattr(self, '_qr_login_required_message', '') or login_error
+                    )
                 if await self._protect_account_from_risk_login_retry(login_error):
                     if refresh_risk_log_id:
                         self._update_risk_log(
@@ -1993,6 +2099,14 @@ class XianyuAuthRecoveryMixin:
                     )
                 await self._request_stop_after_account_pause("检测到账号高风险登录异常")
                 return False
+            # 回调已判定"平台打回扫码页"时，这里的异常基本是因此而来的连锁报错
+            # （Chromium 被杀后的 Target closed）。同一件事要留住状态与面板文案，
+            # 不能退化成普通异常——status_note 落库，重启后告警也不会丢。
+            if getattr(self, '_qr_login_required', False):
+                self.last_token_refresh_status = 'verification_pending_manual'
+                self._mark_qr_login_required(
+                    getattr(self, '_qr_login_required_message', '') or str(refresh_e)
+                )
             self.last_token_refresh_error_message = self._safe_str(refresh_e)
             backoff_reason, backoff_seconds = self.classify_password_login_failure(str(refresh_e))
             self.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)

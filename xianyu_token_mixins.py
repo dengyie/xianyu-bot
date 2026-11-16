@@ -1012,6 +1012,12 @@ class TokenMixin:
         self._round_solve_suppressed_until = 0.0
         self.last_token_refresh_status = "success"
         self.last_token_refresh_error_message = None
+        # 扫码登录成功后清掉面板上的「待扫码登录」告警。条件清除：只清本链路
+        # 自己写的那条文案，风控暂停/会话过期等其他子系统的示警不受影响。
+        try:
+            self._clear_qr_login_required()
+        except Exception as _clear_qr_e:  # noqa: BLE001
+            logger.debug(f"【{self.cookie_id}】清理待扫码登录标记失败（忽略）: {_clear_qr_e}")
         # Token 成功 → 滑块求解预算清零（正常节奏下一次自然到期只消耗 1 次）
         self._slider_budget_reset()
         if self._consume_pending_slider_success_notice():

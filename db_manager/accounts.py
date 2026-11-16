@@ -208,6 +208,35 @@ class DBAccountsMixin:
             except Exception as e:
                 logger.error(f"更新账号状态文案失败: {e}")
                 return False
+
+    def clear_cookie_status_note_if_equals(self, cookie_id: str, expected_note: str) -> bool:
+        """仅当当前状态文案等于 expected_note 时清空，返回是否真的清掉了。
+
+        状态文案字段被多个子系统共用（风控暂停写「待风控处理」、会话过期写
+        「Session过期，待重新登录」等）。恢复成功时如果无条件清空，会把别的
+        子系统正在示警的文案一起抹掉；条件更新把「只清自己写的那条」变成
+        DB 层的原子语义，避免读-判-写之间的竞态。
+        """
+        expected = str(expected_note or '').strip()
+        if not expected:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET status_note = '' WHERE id = ? AND status_note = ?",
+                    (cookie_id, expected),
+                )
+                self.conn.commit()
+                cleared = int(getattr(cursor, 'rowcount', 0) or 0) > 0
+                if cleared:
+                    logger.info(f"清除账号 {cookie_id} 的状态文案: {expected}")
+                return cleared
+            except Exception as e:
+                logger.error(f"按条件清除账号状态文案失败: {e}")
+                return False
+
     def set_cookie_qr_login_grace_until(self, cookie_id: str, grace_until: int) -> bool:
         """更新账号扫码登录稳定期截止时间"""
         with self.lock:

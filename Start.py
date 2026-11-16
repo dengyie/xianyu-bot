@@ -523,6 +523,20 @@ async def main():
     setup_file_logging()
     logger.info("文件日志收集器已启动，开始收集实时日志")
 
+    # 预热 slidex 导入：启动阶段 API 线程（api_captcha_remote → slidex.remote）与
+    # 账号任务（xianyu_auth_recovery → slidex.stealth）会并发首次导入 slidex。两个
+    # 线程同时执行包初始化会互相等待对方持有的子模块锁，最终报
+    # `cannot import name 'CaptchaRemoteController' from partially initialized module
+    # 'slidex.remote'`，API 线程随之以 KeyError('slidex') 起不来（2026-11-16 线上部署
+    # 事故：health/live 连续 5 分钟 connection reset）。在主线程串行导完再起线程。
+    try:
+        import slidex  # noqa: F401
+        import slidex.remote  # noqa: F401
+        import slidex.stealth  # noqa: F401
+        logger.info("slidex 模块预热完成")
+    except Exception as prewarm_err:
+        logger.warning(f"slidex 模块预热失败（不阻断启动）: {prewarm_err}")
+
     loop = asyncio.get_running_loop()
 
     # 创建 CookieManager 并在全局暴露

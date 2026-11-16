@@ -42,8 +42,14 @@ class TestCountedReason:
         assert _BackoffHost._is_counted_password_login_failure_reason("slider_failed") is True
         assert _BackoffHost._is_counted_password_login_failure_reason("risk_control") is True
 
-    def test_unrelated_reasons_not_counted(self):
-        for reason in ("", None, "credentials", "verification_required", "unknown"):
+    def test_blocked_login_reasons_are_counted(self):
+        # 2026-11-16：平台把密码登录打回扫码页后，每轮都是 verification_required
+        # 或 login_timeout 交替，过去这两类不计入 → 保护链永远不触发。
+        assert _BackoffHost._is_counted_password_login_failure_reason("verification_required") is True
+        assert _BackoffHost._is_counted_password_login_failure_reason("login_timeout") is True
+
+    def test_truly_unrelated_reasons_not_counted(self):
+        for reason in ("", None, "credentials", "login_not_confirmed", "unknown"):
             assert _BackoffHost._is_counted_password_login_failure_reason(reason) is False
 
 
@@ -68,7 +74,7 @@ class TestEscalationCurve:
         # 全局默认 1.5x + 1h 封顶
         assert seen == [600, 900, 1350, 2025]
 
-    def test_reason_switch_resets_consecutive_count(self):
+    def test_reason_switch_resets_escalation_but_not_total_count(self):
         host = _BackoffHost()
         host.set_password_login_failure_backoff(
             host.cookie_id, "slider_punish", 600, escalation_factor=2.0, max_cap_seconds=14400
@@ -77,7 +83,12 @@ class TestEscalationCurve:
             host.cookie_id, "slider_punish", 600, escalation_factor=2.0, max_cap_seconds=14400
         )
         host.set_password_login_failure_backoff(host.cookie_id, "slider_failed", 600)
-        assert host.get_password_login_failure_backoff(host.cookie_id)["seconds"] == 600
+        state = host.get_password_login_failure_backoff(host.cookie_id)
+        # 换因后升级曲线回到基线（不被上一个原因串着放大）
+        assert state["seconds"] == 600
+        assert state["same_reason_count"] == 1
+        # 但连续失败总数跨因继续累计，供自动暂停保护判定
+        assert state["consecutive_count"] == 3
 
 
 class TestSkipWhitelist:

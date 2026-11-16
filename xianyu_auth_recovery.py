@@ -477,6 +477,15 @@ class XianyuAuthRecoveryMixin:
     # 状态,consecutive_count 恒为 1——升级曲线（slider_punish 2x 到 4h 封顶）和
     # "连续 N 次风控失败→自动暂停"保护双双失效（2026-11-15 review 确认线上从未
     # 出现过 consecutive_failure_protected）。
+    #
+    # 2026-11-16 二次修正：只有"同因连击"才累加计数仍然有洞——线上平台把密码登录
+    # 打回扫码页后，失败原因在 verification_required 与 login_timeout 之间交替，
+    # 每轮理由都不同 → consecutive_count 反复归 1 → 5 小时里保护一次没触发。
+    # 因此拆成两个计数：
+    #   consecutive_count   —— 计入保护链的风控类原因连续失败数（良性失败不累计、
+    #                          也不打断），驱动自动暂停保护；
+    #   same_reason_count   —— 最近同一理由的连击数，仍用于按类型升级的退避曲线，
+    #                          避免不同原因的退避时长被串着放大。
     _password_login_backoff_streak_retention_seconds = 6 * 3600
 
     @classmethod
@@ -522,6 +531,31 @@ class XianyuAuthRecoveryMixin:
 
 
     @classmethod
+    def reset_password_login_backoff_timer(cls, cookie_id: str):
+        """只解除当前退避计时，保留连续风控失败计数。
+
+        用于「上一次失败是 slider_failed，但刚才已经通过滑块」的场景：通过滑块是
+        真实的进展，不该继续等退避；但它并不能证明账号已经恢复正常，所以不能像
+        clear 那样把 consecutive_count 一起抹掉——否则「4 次风控失败 + 滑块通过 +
+        再次失败」会从 1 重新计数，自动暂停保护又被推迟 4 轮（2026-11-16）。
+        """
+        if not cookie_id:
+            return
+        state = cls._password_login_failure_backoff.get(cookie_id)
+        if not state:
+            return
+        cls._password_login_failure_backoff[cookie_id] = {
+            **state,
+            # 用「当前时间」而不是 0 表示到期：清理逻辑按 until + 保留窗口判断，
+            # 写 0 会让记录被当成 1970 年的陈账立即丢弃，连续计数也就白保了。
+            'until': time.time(),
+            'seconds': 0,
+            # 同因连击被一次成功的滑块打断，升级曲线从基础时长重新开始
+            'same_reason_count': 0,
+        }
+
+
+    @classmethod
     def set_password_login_failure_backoff(cls, cookie_id: str, reason: str, seconds: int,
                                            *, escalation_factor: Optional[float] = None,
                                            max_cap_seconds: Optional[int] = None):
@@ -530,20 +564,36 @@ class XianyuAuthRecoveryMixin:
         escalation_factor / max_cap_seconds：按失败类型覆盖全局升级曲线。
         风控惩罚类失败（slider_punish）用更陡的 2x 升级 + 4h 封顶——设备被判罚
         后短间隔重探只会加深惩罚；本地异常类维持全局 1.5x + 1h 默认曲线。
+
+        两个计数分离（2026-11-16）：
+        - consecutive_count：计入保护链的风控类原因的连续失败数（良性失败既不
+          累加也不打断链），供 _protect_account_for_consecutive_failures 判定阈值；
+        - same_reason_count：连续相同理由的连击数，仅用于本函数的指数升级 exponent，
+          不同理由交替时其退避时长不会被跨因放大。
         """
         if not cookie_id or seconds <= 0:
             return
         previous_state = cls._password_login_failure_backoff.get(cookie_id) or {}
         previous_reason = previous_state.get('reason')
         previous_count = int(previous_state.get('consecutive_count', 0) or 0)
-        consecutive_count = previous_count + 1 if previous_reason == reason else 1
+        previous_same_reason_count = int(previous_state.get('same_reason_count', 0) or 0)
+        # 总连续失败数：只有计入保护链的风控类原因才累加。良性失败（network/
+        # unknown/login_not_confirmed 等）既不计入、也不打断链——一次瞬断不该
+        # 让此前 4 次真实风控失败白记，也不该让「4 次瞬断 + 1 次风控」被误判成
+        # 5 连击而错停健康账号（2026-11-16 审查 P1）。
+        if cls._is_counted_password_login_failure_reason(reason):
+            consecutive_count = previous_count + 1
+        else:
+            consecutive_count = previous_count
+        # 同因连击数：仅用于退避升级曲线。
+        same_reason_count = previous_same_reason_count + 1 if previous_reason == reason else 1
         if escalation_factor is None:
             escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
         if max_cap_seconds is None:
             max_cap_seconds = int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600)
         escalation_factor = max(1.0, float(escalation_factor))
         max_cap = max(seconds, int(max_cap_seconds))
-        actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
+        actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, same_reason_count - 1)), max_cap)))
         actual_seconds = max(seconds, actual_seconds)
         now = time.time()
         cls._password_login_failure_backoff[cookie_id] = {
@@ -552,16 +602,32 @@ class XianyuAuthRecoveryMixin:
             'seconds': actual_seconds,
             'base_seconds': seconds,
             'consecutive_count': consecutive_count,
+            'same_reason_count': same_reason_count,
             'created_at': now,
         }
 
 
     @staticmethod
     def _is_counted_password_login_failure_reason(reason: str) -> bool:
-        # slider_punish(300 other-punish)与 slider_failed 同等计入连续失败:
-        # 惩罚退避 2x 升级 + 4h 封顶后仍连续命中,说明设备/会话已被持续判罚,
-        # 继续自动重探只会加深惩罚——须累计到阈值触发自动暂停保护。
-        return str(reason or '').strip() in {'slider_failed', 'slider_punish', 'risk_control'}
+        """该失败原因是否计入「连续失败→自动暂停」保护链。
+
+        slider_punish(300 other-punish)与 slider_failed 同等计入连续失败:
+        惩罚退避 2x 升级 + 4h 封顶后仍连续命中,说明设备/会话已被持续判罚,
+        继续自动重探只会加深惩罚——须累计到阈值触发自动暂停保护。
+
+        verification_required / login_timeout 同样必须计入（2026-11-16 线上事故）：
+        平台把密码登录强制打回扫码页后，每一轮都是「等扫码 450 秒 → empty →
+        整体超时」，间歇夹杂宽带窗口里的 login_timeout。这两类过去不在名单内，
+        于是连续 5 小时里每一轮都被当成"可以继续重试"的普通失败：反复拉起
+        Chromium、反复提交账密、反复过滑块，对已被判罚的账号是纯粹的放大器。
+        """
+        return str(reason or '').strip() in {
+            'slider_failed',
+            'slider_punish',
+            'risk_control',
+            'verification_required',
+            'login_timeout',
+        }
 
 
     def _get_night_mode_settings(self) -> Dict[str, Any]:
@@ -812,7 +878,14 @@ class XianyuAuthRecoveryMixin:
 
     @staticmethod
     def _is_account_pause_status(status: str) -> bool:
-        return status in {"account_risk_protected", "manual_verification_required"}
+        # consecutive_failure_protected 也是暂停态：漏掉它会让 token 链路把
+        # 保护状态覆写成普通的 token_expired_recovery_failed，重试/文案全部失准
+        # （2026-11-16 审查 P1）。
+        return status in {
+            "account_risk_protected",
+            "manual_verification_required",
+            "consecutive_failure_protected",
+        }
 
 
     @staticmethod
@@ -1339,6 +1412,18 @@ class XianyuAuthRecoveryMixin:
         backoff_reason, backoff_seconds = self.classify_password_login_failure(slider_reason or message)
         self.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
         logger.warning(f"【{self.cookie_id}】已进入失败退避期: {backoff_reason}, {backoff_seconds}秒")
+        # 超时是本项目最主要的失败模式（等扫码 450s→页面空→整体超时），必须和普通
+        # 失败分支一样走连续失败保护：否则每轮只记退避、永不累计到阈值，事故里
+        # 反复拉起 Chromium 的放大器行为不会被刹车（2026-11-16 审查 P0）。
+        try:
+            protected = await self._protect_account_for_consecutive_failures(
+                self.get_password_login_failure_backoff(self.cookie_id)
+            )
+        except Exception as protect_e:  # noqa: BLE001 保护失败不应吞掉超时收口
+            protected = False
+            logger.warning(f"【{self.cookie_id}】超时收口执行连续失败保护失败: {self._safe_str(protect_e)}")
+        if protected:
+            return
         if refresh_risk_log_id:
             self._update_risk_log(
                 refresh_risk_log_id,
@@ -1472,7 +1557,10 @@ class XianyuAuthRecoveryMixin:
                 logger.warning(
                     f"【{self.cookie_id}】检测到最近刚通过滑块，忽略一次旧的 slider_failed 退避并继续尝试密码登录刷新"
                 )
-                self.clear_password_login_failure_backoff(self.cookie_id)
+                # 只解除这次 slider_failed 的退避计时，保留连续风控失败计数：
+                # 滑块通过是进展，但不等于账号恢复；直接 clear 会把此前的风控
+                # 连击清零，让自动暂停保护又被推迟若干轮（2026-11-16）。
+                self.reset_password_login_backoff_timer(self.cookie_id)
                 failure_backoff = None
             else:
                 logger.warning(
@@ -1517,6 +1605,12 @@ class XianyuAuthRecoveryMixin:
         recovery_lock_acquired, existing_lock = self.acquire_auth_recovery_lock(
             self.cookie_id,
             recovery_lock_owner,
+            # 锁必须活过整段密码登录（默认 deadline 600s），否则登录进行到一半
+            # 锁就过期，另一路恢复可并发拉起第二个 Chromium（2026-11-16 审查 P2）。
+            ttl=max(
+                int(getattr(self, '_auth_recovery_lock_ttl', 240) or 240),
+                int(_PASSWORD_LOGIN_DEADLINE_SECONDS) + 120,
+            ),
         )
         if not recovery_lock_acquired:
             existing_owner = (existing_lock or {}).get('owner', 'unknown')
@@ -1579,6 +1673,9 @@ class XianyuAuthRecoveryMixin:
                         duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
                         event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
                     )
+                # 视为一次成功恢复：清掉密码登录失败连击，避免旧计数残留导致
+                # 下一次失败带旧计数提前触发暂停（2026-11-16 审查 P2）。
+                self.clear_password_login_failure_backoff(self.cookie_id)
                 return True
             
             username = account_info.get('username', '')

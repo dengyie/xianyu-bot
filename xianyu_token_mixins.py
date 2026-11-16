@@ -521,7 +521,7 @@ class TokenMixin:
                                         f"【{self.cookie_id}】滑块被风控惩罚拒绝"
                                         f"(slide_code={getattr(self, 'last_slider_slide_code', None)})，"
                                         f"进入惩罚退避期: slider_punish, {punish_remaining}秒"
-                                        f"（第{punish_state.get('consecutive_count', 1)}次，倍增升级）"
+                                        f"（同因第{punish_state.get('same_reason_count', 1)}次，倍增升级）"
                                     )
                                     _host.log_captcha_event(
                                         self.cookie_id,

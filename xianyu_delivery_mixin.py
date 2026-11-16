@@ -242,6 +242,110 @@ class DeliveryMixin:
         finalized = finalized_units or set()
         return all(unit in finalized for unit in range(1, quantity + 1))
 
+    _delivery_retry_max_attempts = 3
+    _delivery_retry_min_interval_seconds = 30 * 60
+
+    async def _sweep_stuck_delivery_orders(self, *, max_orders: int = 5) -> int:
+        """补发扫描：把长时间停在「部分发货」的订单交回幂等发货链路。
+
+        2026-11-16：多数量订单中途失败后，只有买家再发一条消息（或进程重启）才会
+        重试；买家不再说话时订单永久停在 partial_success/partial_pending_finalize，
+        已发的没确认、没发的永远不会补。这里定期扫本地库，把候选订单交回与实时
+        消息完全相同的 `_handle_auto_delivery`（订单锁 + unit 状态机 + finalized
+        闸门），因此已完成单元不会被重发。
+
+        安全边界：
+        - 只扫 partial_success / partial_pending_finalize，且必须已有发货单元记录
+          （DB 层 EXISTS 过滤）；普通 pending_ship 不在其列——那多数是人工发货或
+          无卡可发的常态，自动补发会给买家推失败通知。
+        - 必须能拿到 sid 定位会话；否则留给人工恢复入口。
+        - 每单进程内最多 3 次、间隔 30 分钟；完成后 finalized 状态会让它自然移出候选。
+        """
+        try:
+            if not self.is_auto_confirm_enabled():
+                return 0
+        except Exception:
+            return 0
+        websocket = getattr(self, 'ws', None)
+        if websocket is None:
+            return 0
+
+        try:
+            orders = _db_package().get_stuck_delivery_orders(
+                self.cookie_id,
+                statuses=('partial_success', 'partial_pending_finalize'),
+                older_than_minutes=10,
+                limit=max_orders,
+            )
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】补发扫描查询失败: {self._safe_str(e)}")
+            return 0
+
+        if not orders:
+            return 0
+
+        now = time.time()
+        attempts = getattr(self, '_delivery_retry_attempts', None)
+        if attempts is None:
+            attempts = self._delivery_retry_attempts = {}
+
+        resumed = 0
+        active_ids = set()
+        for order in orders:
+            order_id = str(order.get('order_id') or '').strip()
+            if not order_id:
+                continue
+            active_ids.add(order_id)
+            history = attempts.get(order_id) or {'count': 0, 'last_ts': 0.0}
+            if int(history.get('count') or 0) >= self._delivery_retry_max_attempts:
+                continue
+            if now - float(history.get('last_ts') or 0.0) < self._delivery_retry_min_interval_seconds:
+                continue
+
+            item_id = str(order.get('item_id') or '').strip()
+            buyer_id = str(order.get('buyer_id') or '').strip()
+            sid = str(order.get('sid') or '').strip()
+            if not item_id or not buyer_id or not sid:
+                continue
+
+            expected_quantity = self._get_order_expected_delivery_quantity(order_id)
+            finalized_units = self._get_finalized_delivery_unit_indexes(order_id)
+            if self._delivery_units_all_finalized(finalized_units, expected_quantity):
+                attempts.pop(order_id, None)
+                continue
+
+            history['count'] = int(history.get('count') or 0) + 1
+            history['last_ts'] = now
+            attempts[order_id] = history
+
+            logger.warning(
+                f"【{self.cookie_id}】补发扫描命中部分发货订单，第 {history['count']}/"
+                f"{self._delivery_retry_max_attempts} 次补发: order_id={order_id}, "
+                f"status={order.get('order_status')}, units={sorted(finalized_units)}/{expected_quantity}"
+            )
+            try:
+                await self._handle_auto_delivery(
+                    websocket,
+                    {},
+                    order.get('buyer_nick') or '买家',
+                    buyer_id,
+                    item_id,
+                    sid.replace('@goofish', ''),
+                    time.strftime('%Y-%m-%d %H:%M:%S'),
+                    order_id=order_id,
+                )
+                resumed += 1
+            except Exception as e:
+                logger.warning(
+                    f"【{self.cookie_id}】补发扫描执行失败: order_id={order_id}, error={self._safe_str(e)}"
+                )
+
+        # 已不在候选中的订单释放内存，避免长时间运行后字典膨胀
+        for stale_id in [key for key in list(attempts.keys()) if key not in active_ids]:
+            attempts.pop(stale_id, None)
+
+        return resumed
+
     def _get_pending_delivery_finalization_meta(self, order_id: str, delivery_unit_index: int = 1):
         if not order_id:
             return None
@@ -281,6 +385,49 @@ class DeliveryMixin:
             last_error=str(reason or '订单已处于平台终态，无需继续补确认'),
         )
         logger.warning(f"【{self.cookie_id}】订单 {order_id} 停止补确认重试: {reason or '订单已处于平台终态'}")
+
+    def _complete_delivery_unit_after_terminal_confirm(self, order_id: str, item_id: str, buyer_id: str,
+                                                       delivery_meta: dict = None,
+                                                       delivery_unit_index: int = 1,
+                                                       error: str = '',
+                                                       channel: str = 'auto',
+                                                       buyer_nick: str = '') -> None:
+        """卡券已发出、但平台返回终态（已发货/已关闭/已退款）时，把单元直接收尾。
+
+        确认动作在这种订单上不可能再成功；继续把单元留在 sent 只会让每轮触发都重新
+        补确认、刷错误日志，并可能给买家重复推失败通知（2026-11-16）。
+        """
+        meta = dict(delivery_meta or {})
+        meta.setdefault('success', True)
+        meta.setdefault('delivery_unit_index', delivery_unit_index)
+        error_text = str(error or '').strip()
+        self._persist_delivery_finalization_state(
+            order_id=order_id,
+            item_id=item_id,
+            buyer_id=buyer_id,
+            delivery_meta=meta,
+            channel=channel,
+            status='finalized',
+            last_error=error_text or None,
+        )
+        self._record_delivery_log(
+            order_id=order_id,
+            item_id=item_id,
+            buyer_id=buyer_id,
+            buyer_nick=buyer_nick or None,
+            status='success',
+            reason=(
+                f'卡券已发出，平台订单已处于终态，跳过确认: {error_text}'
+                if error_text else '卡券已发出，平台订单已处于终态，跳过确认'
+            ),
+            channel=channel,
+            rule_meta=meta,
+        )
+        logger.warning(
+            f"【{self.cookie_id}】订单 {order_id} 第 {delivery_unit_index} 个单元确认撞上平台终态，"
+            f"按完成收尾: {error_text or '平台已处于终态'}"
+        )
+
     def _mark_delivery_pending_platform_confirm(self, order_id: str, item_id: str, buyer_id: str,
                                                 delivery_meta: dict = None, confirm_error: str = None,
                                                 expected_quantity: int = 1,
@@ -428,11 +575,15 @@ class DeliveryMixin:
 
         return False
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
-                                   item_id: str, chat_id: str, msg_time: str, message_data: dict = None):
+                                   item_id: str, chat_id: str, msg_time: str, message_data: dict = None,
+                                   *, order_id: str = None):
         """统一处理自动发货逻辑
         
         Args:
             message_data: 原始的WebSocket消息数据，用于提取订单ID时的备用搜索
+            order_id: 已定位的订单ID（补发扫描/恢复链路用）。给出时跳过消息解析与
+                sid 兜底查单，直接进入锁内发货——保证补发走的是与实时消息同一条
+                幂等路径（unit 状态机 + finalized 闸门）。
         """
         try:
             from db_manager import db_manager
@@ -478,7 +629,8 @@ class DeliveryMixin:
                 return
 
             # 提取订单ID（传递原始消息数据以便在解密消息中找不到时进行备用搜索）
-            order_id = self._extract_order_id(message, message_data)
+            # 补发扫描会直接传入 order_id，此时跳过解析与 sid 兜底
+            order_id = str(order_id or '').strip() or self._extract_order_id(message, message_data)
 
             # 如果order_id不存在，尝试通过sid进行兜底查单
             if not order_id:
@@ -527,10 +679,21 @@ class DeliveryMixin:
                     recent_order = sid_lookup.get('order')
                     sid_match_type = sid_lookup.get('match_type', 'missing')
 
-                    if recent_order and sid_match_type in {'pending_ship', 'bargain_ready'}:
+                    if recent_order and sid_match_type in {'pending_ship', 'bargain_ready', 'suspicious_shipped'}:
                         fallback_order_id = recent_order.get('order_id')
                         fallback_item_id = recent_order.get('item_id')
                         fallback_buyer_id = recent_order.get('buyer_id')
+
+                        if sid_match_type == 'suspicious_shipped':
+                            # 平台标成已发货、但库里没有任何发货单元记录：说明确认发货
+                            # 不是我们做的（或进度证据丢失），卡券大概率没发。此前这里
+                            # 落到 else 分支按「状态不适合兜底发货」永久跳过，纠偏日志
+                            # 写了「继续允许纠偏」却永远不执行（2026-11-16 审查）。
+                            # 已 finalized 的单元仍由锁内 finalized 闸门拦住，不会重发。
+                            logger.warning(
+                                f'[{msg_time}] 【{self.cookie_id}】⚠️ sid兜底命中可疑已发货订单'
+                                f'（无发货进度证据），继续纠偏: sid={fallback_sid}, order_id={fallback_order_id}'
+                            )
 
                         # 防串单：买家不一致直接拒绝（仅当 DB 中的 buyer_id 可信时才校验）
                         if send_user_id and fallback_buyer_id and self._is_trustworthy_buyer_id(fallback_buyer_id) and str(send_user_id) != str(fallback_buyer_id):
@@ -699,6 +862,13 @@ class DeliveryMixin:
                 )
                 return
 
+            # 应发数量下限预读：只依赖 order_id 的本地 SQLite 查询，helper 内部失败
+            # 已有兜底（返回 >=1 并告警），不会抛异常。放在订单锁外，避免锁内再叠
+            # 一次同步读库——锁内还有拉订单详情与发消息两个网络步骤（2026-11-16）。
+            expected_quantity_hint = (
+                self._get_order_expected_delivery_quantity(order_id) if order_id else 1
+            )
+
             # 获取或创建该订单的锁
             order_lock = self._order_locks[lock_key]
 
@@ -778,16 +948,19 @@ class DeliveryMixin:
                     else:
                         logger.info(f"无订单ID，发送单个卡券")
 
-                    if multi_quantity_delivery and order_id and quantity_to_send <= 1:
-                        # 订单详情里没有数量时用本地订单/已记录单元兜底，否则多数量订单
-                        # 只发 1 张卡、进度按 1/1 汇总成 shipped，买家永久少收且无告警。
-                        fallback_quantity = self._get_order_expected_delivery_quantity(order_id)
-                        if fallback_quantity > 1:
-                            quantity_to_send = fallback_quantity
+                    if multi_quantity_delivery and order_id:
+                        # 以本地订单/已记录单元为权威下限：订单详情页走缓存时数量可能
+                        # 偏小（fetch_order_detail_info 默认 force_refresh=False），
+                        # 只在 <=1 时兜底会让「详情=2、真实=3」的订单永久少发一张，
+                        # 且进度按 2/2 汇总成 shipped 后再无补发入口（2026-11-16 审查 P1）。
+                        expected_quantity = expected_quantity_hint
+                        if expected_quantity > quantity_to_send:
                             logger.warning(
-                                f"【{self.cookie_id}】订单 {order_id} 详情缺少数量信息，"
-                                f"按本地订单数量兜底: 将发送 {quantity_to_send} 个卡券"
+                                f"【{self.cookie_id}】订单 {order_id} 详情/兜底数量({quantity_to_send}) "
+                                f"低于本地应发数量({expected_quantity})，按应发数量发送 "
+                                f"{expected_quantity} 个卡券"
                             )
+                            quantity_to_send = expected_quantity
 
                     # 防重复发货：已 finalized 的单元永不再发。
                     # 「[记得及时发货]」这类提醒会在发货完成很久之后重复到达，而内存冷却
@@ -842,6 +1015,22 @@ class DeliveryMixin:
                                 )
                                 if not finalize_result.get('success'):
                                     last_delivery_error = finalize_result.get('error') or f"第 {unit_index} 个卡券补完成收尾失败"
+                                    if self._is_non_retryable_platform_confirm_error(
+                                        last_delivery_error, finalize_result.get('confirm_result')
+                                    ):
+                                        # 补确认撞上平台终态：卡券早已发出，确认不需要也不可
+                                        # 能再成功，直接收尾，避免每轮补发都刷一次错误（2026-11-16）。
+                                        self._complete_delivery_unit_after_terminal_confirm(
+                                            order_id=order_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            delivery_meta=pending_finalize_meta,
+                                            delivery_unit_index=unit_index,
+                                            error=last_delivery_error,
+                                            buyer_nick=send_user_name,
+                                        )
+                                        successful_send_count += 1
+                                        continue
                                     if self._is_platform_confirm_failure_error(last_delivery_error):
                                         self._mark_delivery_pending_platform_confirm(
                                             order_id=order_id,
@@ -1084,6 +1273,23 @@ class DeliveryMixin:
                                 )
                                 if not finalize_result.get('success'):
                                     last_delivery_error = finalize_result.get('error') or f"第 {unit_index} 条消息发送成功但提交发货副作用失败"
+                                    if self._is_non_retryable_platform_confirm_error(
+                                        last_delivery_error, finalize_result.get('confirm_result')
+                                    ):
+                                        # 平台订单已是终态（已发货/已关闭/已退款）：确认动作不可能
+                                        # 再成功，继续重试只会把单元永久卡在 sent 并反复刷错误日志。
+                                        # 卡券已经真实发出，按完成收尾（2026-11-16）。
+                                        self._complete_delivery_unit_after_terminal_confirm(
+                                            order_id=order_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            delivery_meta=unit_rule_meta,
+                                            delivery_unit_index=unit_index,
+                                            error=last_delivery_error,
+                                            buyer_nick=send_user_name,
+                                        )
+                                        successful_send_count += 1
+                                        continue
                                     if self._is_platform_confirm_failure_error(last_delivery_error):
                                         self._mark_delivery_pending_platform_confirm(
                                             order_id=order_id,

@@ -1696,6 +1696,63 @@ class DBOrdersMixin:
             except Exception as e:
                 logger.error(f"获取Cookie订单列表失败: {cookie_id} - {e}")
                 return []
+    def get_stuck_delivery_orders(self, cookie_id: str, *, statuses=None,
+                                  older_than_minutes: int = 10, limit: int = 10):
+        """返回长时间停留在部分发货状态、且已有发货单元记录的订单。
+
+        供补发扫描使用（2026-11-16）：多数量订单中途失败后若买家不再发消息，订单会
+        永久停在 partial_success/partial_pending_finalize。这里只挑「已经发过至少一个
+        单元」的订单（EXISTS 子查询），避免把人工发货的普通待发货订单卷进自动补发。
+        """
+        normalized_statuses = []
+        for status in (statuses or ('partial_success', 'partial_pending_finalize')):
+            normalized = self._normalize_order_status(status) or status
+            if normalized and normalized not in normalized_statuses:
+                normalized_statuses.append(normalized)
+        if not normalized_statuses:
+            return []
+
+        try:
+            older_minutes = max(0, int(older_than_minutes))
+            row_limit = max(1, min(int(limit or 1), 100))
+        except (TypeError, ValueError):
+            older_minutes, row_limit = 10, 10
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ','.join('?' for _ in normalized_statuses)
+                cursor.execute(f'''
+                SELECT order_id, item_id, buyer_id, buyer_nick, sid, quantity, order_status,
+                       created_at, updated_at
+                FROM orders
+                WHERE cookie_id = ?
+                  AND order_status IN ({placeholders})
+                  AND datetime(COALESCE(updated_at, created_at)) <= datetime('now', ?)
+                  AND EXISTS (
+                      SELECT 1 FROM delivery_finalization_states s WHERE s.order_id = orders.order_id
+                  )
+                ORDER BY COALESCE(updated_at, created_at) ASC, created_at ASC
+                LIMIT ?
+                ''', (cookie_id, *normalized_statuses, f'-{older_minutes} minutes', row_limit))
+
+                return [
+                    {
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': self._sanitize_order_buyer_nick(row[3]),
+                        'sid': row[4],
+                        'quantity': row[5],
+                        'order_status': row[6],
+                        'created_at': row[7],
+                        'updated_at': row[8],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"查询待补发订单失败: {cookie_id} - {e}")
+                return []
     def delete_order(self, order_id: str, cookie_id: str = None) -> bool:
         """删除订单，可选限定所属账号。"""
         with self.lock:

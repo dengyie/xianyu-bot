@@ -729,10 +729,13 @@ def get_user_log_prefix(user_info: Dict[str, Any] = None) -> str:
 
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """要求管理员权限"""
-    # 优先使用is_admin字段，兼容旧的admin用户名判断
-    is_admin = current_user.get('is_admin', False) or current_user['username'] == 'admin'
-    if not is_admin:
+    """要求管理员权限。
+
+    只认 is_admin 字段：历史 admin 用户名由 db_manager 的迁移
+    （`UPDATE users SET is_admin = 1 WHERE username = 'admin'`）与读取兜底保证，
+    鉴权层不再硬编码用户名，避免「任何叫 admin 的账号自动是管理员」（2026-11-16）。
+    """
+    if not current_user.get('is_admin', False):
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return current_user
 

@@ -45,7 +45,7 @@ async def test_password_login_refresh_defers_when_same_account_slider_active(mon
         def _get_active_password_login_failure_backoff(self, current_time=None):
             return None
 
-        def acquire_auth_recovery_lock(self, cookie_id, owner):
+        def acquire_auth_recovery_lock(self, cookie_id, owner, ttl=None):
             return True, None
 
         def release_auth_recovery_lock(self, cookie_id, owner):

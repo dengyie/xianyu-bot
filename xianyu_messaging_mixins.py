@@ -2212,11 +2212,19 @@ class MessagePipelineMixin:
                             recent_order = sid_lookup.get('order')
                             sid_match_type = sid_lookup.get('match_type', 'missing')
                             
-                            if recent_order and sid_match_type in {'pending_ship', 'bargain_ready'}:
+                            if recent_order and sid_match_type in {'pending_ship', 'bargain_ready', 'suspicious_shipped'}:
                                 order_id = recent_order.get('order_id')
                                 real_item_id = recent_order.get('item_id')
                                 simple_user_id = recent_order.get('buyer_id', user_id)  # 从订单中获取buyer_id
                                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 通过sid从数据库找到订单: order_id={order_id}, item_id={real_item_id}, buyer_id={simple_user_id}')
+
+                                if sid_match_type == 'suspicious_shipped':
+                                    # 已发货但无任何发货单元记录 → 卡券大概率没发，继续纠偏
+                                    # （2026-11-16 审查）；已完成单元由 finalized 闸门拦住。
+                                    logger.warning(
+                                        f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ⚠️ sid兜底命中可疑已发货订单'
+                                        f'（无发货进度证据），继续纠偏: order_id={order_id}'
+                                    )
 
                                 if sid_match_type == 'bargain_ready':
                                     logger.info(
@@ -3634,25 +3642,34 @@ class SendMixin:
                     item_id=item_id,
                 )
                 if not finalize_result.get('success'):
-                    self._persist_delivery_finalization_state(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        delivery_meta=pending_finalize_meta,
-                        channel='auto',
-                        status='sent',
-                        last_error=finalize_result.get('error') or '补偿发货补完成 finalize 失败',
+                    finalize_error = finalize_result.get('error') or '补偿发货补完成 finalize 失败'
+                    if not self._is_non_retryable_platform_confirm_error(
+                        finalize_error, finalize_result.get('confirm_result')
+                    ):
+                        self._persist_delivery_finalization_state(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            delivery_meta=pending_finalize_meta,
+                            channel='auto',
+                            status='sent',
+                            last_error=finalize_error,
+                        )
+                        self._record_delivery_log(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            status='failed',
+                            reason=finalize_result.get('error') or '补偿发货检测到已发送记录，但补完成发货收尾失败',
+                            channel='auto',
+                            rule_meta=pending_finalize_meta,
+                        )
+                        return False
+                    # 平台已是终态：卡券已在之前的发送中发出，补确认不可能成功，
+                    # 直接落到下面的成功收尾（2026-11-16）。
+                    logger.warning(
+                        f"【{self.cookie_id}】{source} 订单 {order_id} 补确认撞上平台终态，按完成收尾: {finalize_error}"
                     )
-                    self._record_delivery_log(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        status='failed',
-                        reason=finalize_result.get('error') or '补偿发货检测到已发送记录，但补完成发货收尾失败',
-                        channel='auto',
-                        rule_meta=pending_finalize_meta,
-                    )
-                    return False
 
                 self._persist_delivery_finalization_state(
                     order_id=order_id,
@@ -3739,25 +3756,35 @@ class SendMixin:
                     item_id=item_id,
                 )
                 if not finalize_result.get('success'):
-                    self._persist_delivery_finalization_state(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        delivery_meta=delivery_meta,
-                        channel='auto',
-                        status='sent',
-                        last_error=finalize_result.get('error') or '补偿发货发送成功但提交发货副作用失败',
-                    )
-                    self._record_delivery_log(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        status='failed',
-                        reason=finalize_result.get('error') or '补偿发货发送成功但提交发货副作用失败',
-                        channel='auto',
-                        rule_meta=delivery_meta,
-                    )
-                    return False
+                    finalize_error = finalize_result.get('error') or '补偿发货发送成功但提交发货副作用失败'
+                    if self._is_non_retryable_platform_confirm_error(
+                        finalize_error, finalize_result.get('confirm_result')
+                    ):
+                        # 平台已是终态：消息已发出，确认不可能成功，直接按完成收尾，
+                        # 否则该订单每轮都会重发同一条卡券消息（2026-11-16）。
+                        logger.warning(
+                            f"【{self.cookie_id}】{source} 订单 {order_id} 发送后确认撞上平台终态，按完成收尾: {finalize_error}"
+                        )
+                    else:
+                        self._persist_delivery_finalization_state(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            delivery_meta=delivery_meta,
+                            channel='auto',
+                            status='sent',
+                            last_error=finalize_error,
+                        )
+                        self._record_delivery_log(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            status='failed',
+                            reason=finalize_result.get('error') or '补偿发货发送成功但提交发货副作用失败',
+                            channel='auto',
+                            rule_meta=delivery_meta,
+                        )
+                        return False
 
                 self._persist_delivery_finalization_state(
                     order_id=order_id,
@@ -4472,6 +4499,25 @@ class SendMixin:
                     )
                     return
 
+                # 防重复发货：简化路径与统一 _auto_delivery 共用同一道 finalized 闸门。
+                # 「等待卖家发货」简化提醒在发货完成很久之后仍会重复到达，内存冷却与
+                # 进程内集合在重启后都失效，库里的 finalized 状态才是唯一可靠依据
+                # （2026-11-16 审查 P1，与 delivery_mixin 795 行对齐）。
+                if self._get_finalized_delivery_unit_indexes(order_id):
+                    logger.info(
+                        f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 订单 {order_id} 发货单元已完成'
+                        f'（finalized），忽略重复的简化发货触发'
+                    )
+                    self._record_delivery_log(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=user_id,
+                        status='success',
+                        reason='检测到订单发货单元已完成，跳过重复发货（防重复发货）',
+                        channel='auto'
+                    )
+                    return
+
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 📤 开始执行自动发货内容发送（发送成功后再确认发货）')
                 
                 # 获取商品标题
@@ -4486,6 +4532,41 @@ class SendMixin:
                     )
                     if not finalize_result.get('success'):
                         finalize_error = finalize_result.get('error') or '补完成 finalize 失败'
+                        if self._is_non_retryable_platform_confirm_error(
+                            finalize_error, finalize_result.get('confirm_result')
+                        ):
+                            # 平台已是终态：卡券早已发出，补确认不可能成功，直接收尾，
+                            # 否则每轮触发都会刷一次失败日志并给买家推失败通知（2026-11-16）。
+                            self._persist_delivery_finalization_state(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                delivery_meta=pending_finalize_meta,
+                                channel='auto',
+                                status='finalized',
+                                last_error=finalize_error
+                            )
+                            self._sync_order_delivery_progress(
+                                order_id=order_id,
+                                cookie_id=self.cookie_id,
+                                expected_quantity=1,
+                                context="自动发货补完成收尾撞上平台终态"
+                            )
+                            self._activate_delivery_lock(lock_key, delay_minutes=10)
+                            self._record_delivery_log(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                status='success',
+                                reason=f'卡券已发出，平台订单已处于终态，停止补确认: {finalize_error}',
+                                channel='auto',
+                                rule_meta=pending_finalize_meta
+                            )
+                            logger.warning(
+                                f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 订单 {order_id} 补确认撞上平台终态，'
+                                f'按完成收尾: {finalize_error}'
+                            )
+                            return
                         if self._is_platform_confirm_failure_error(finalize_error):
                             self._mark_delivery_pending_platform_confirm(
                                 order_id=order_id,
@@ -4636,6 +4717,50 @@ class SendMixin:
                         if not finalize_result.get('success'):
                             finalize_error = finalize_result.get('error') or '发送成功但提交发货副作用失败'
                             delivery_meta_for_state = delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta
+                            if self._is_non_retryable_platform_confirm_error(
+                                finalize_error, finalize_result.get('confirm_result')
+                            ):
+                                # 平台已是终态（已发货/已关闭）：卡券已经发出，确认动作不可能
+                                # 再成功，直接按完成收尾，避免反复重试与给买家推失败通知
+                                # （2026-11-16）。
+                                self._persist_delivery_finalization_state(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=user_id,
+                                    delivery_meta=delivery_meta_for_state,
+                                    channel='auto',
+                                    status='finalized',
+                                    last_error=finalize_error
+                                )
+                                self._sync_order_delivery_progress(
+                                    order_id=order_id,
+                                    cookie_id=self.cookie_id,
+                                    expected_quantity=1,
+                                    context="自动发货发送成功但平台已处于终态"
+                                )
+                                self._activate_delivery_lock(lock_key, delay_minutes=10)
+                                self._record_delivery_log(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=user_id,
+                                    status='success',
+                                    reason=f'卡券已发出，平台订单已处于终态，跳过确认: {finalize_error}',
+                                    channel='auto',
+                                    rule_meta=delivery_rule_meta
+                                )
+                                await self.send_delivery_failure_notification(
+                                    send_user_name="买家",
+                                    send_user_id=user_id,
+                                    item_id=item_id,
+                                    error_message="发货成功",
+                                    chat_id=chat_id,
+                                    order_id=order_id
+                                )
+                                logger.warning(
+                                    f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 订单 {order_id} 发送后确认撞上平台终态，'
+                                    f'按完成收尾: {finalize_error}'
+                                )
+                                return
                             if self._is_platform_confirm_failure_error(finalize_error):
                                 self._mark_delivery_pending_platform_confirm(
                                     order_id=order_id,

@@ -3617,6 +3617,25 @@ class XianyuLive(DeliveryMixin, CookieMixin, TokenMixin, MessagePipelineMixin, S
                     self._cleanup_instance_caches()
                     await asyncio.sleep(0)  # 让出控制权，允许检查取消信号
 
+                    # 部分发货订单补发扫描（每10分钟一次，按账号独立计时）
+                    # 买家付款后不再说话时，多数量订单中途失败会永久停在 partial_*；
+                    # 这里把候选订单交回幂等发货链路（unit 状态机 + finalized 闸门）。
+                    try:
+                        sweep_now = time.time()
+                        if not getattr(self, '_last_delivery_retry_sweep_time', 0):
+                            self._last_delivery_retry_sweep_time = sweep_now
+                        elif sweep_now - self._last_delivery_retry_sweep_time >= 600:
+                            self._last_delivery_retry_sweep_time = sweep_now
+                            resumed_count = await self._sweep_stuck_delivery_orders()
+                            if resumed_count:
+                                logger.warning(
+                                    f"【{self.cookie_id}】部分发货补发扫描完成：重新进入发货流程 {resumed_count} 单"
+                                )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as sweep_e:
+                        logger.warning(f"【{self.cookie_id}】部分发货补发扫描异常: {self._safe_str(sweep_e)}")
+
                     # 清理QR登录过期会话（每5分钟检查一次）
                     try:
                         from utils.qr_login import qr_login_manager
